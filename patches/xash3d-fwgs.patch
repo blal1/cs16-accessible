@@ -1,0 +1,428 @@
+diff --git a/engine/client/accessibility/access_tts.c b/engine/client/accessibility/access_tts.c
+new file mode 100644
+index 0000000..ce7f9a8
+--- /dev/null
++++ b/engine/client/accessibility/access_tts.c
+@@ -0,0 +1,148 @@
++/*
++access_tts.c - minimal screen reader output (NVDA controller client)
++*/
++
++#include "access_tts.h"
++
++#ifdef _WIN32
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++// Optional transcript: when ACCESS_TTS_LOG names a file, every utterance is
++// appended to it (used by the automated menu tests, and handy for debugging).
++static void LogUtterance( const char *utf8, int interrupt )
++{
++	static int checked;
++	static char path[MAX_PATH];
++	FILE *f;
++
++	if( !checked )
++	{
++		const char *env = getenv( "ACCESS_TTS_LOG" );
++		checked = 1;
++		if( env )
++			snprintf( path, sizeof( path ), "%s", env );
++	}
++	if( !path[0] )
++		return;
++	f = fopen( path, "ab" );
++	if( !f )
++		return;
++	// "! " interrupting speech, "  " queued speech, "# " diagnostic only
++	fprintf( f, "%s%s\n", interrupt == 2 ? "# " : ( interrupt ? "! " : "  " ), utf8 );
++	fclose( f );
++}
++
++typedef unsigned long ( __stdcall *nvdaSpeakText_t )( const wchar_t *text );
++typedef unsigned long ( __stdcall *nvdaCancelSpeech_t )( void );
++
++static int s_loadTried;
++static nvdaSpeakText_t s_pfnSpeakText;
++static nvdaCancelSpeech_t s_pfnCancelSpeech;
++
++static void LoadNvda( void )
++{
++	HMODULE self = NULL, lib = NULL;
++	wchar_t path[MAX_PATH];
++
++	if( s_loadTried )
++		return;
++	s_loadTried = 1;
++
++	// Next to the calling module first (cl_dlls\ for client and menu, engine dir for xash.dll).
++	if( GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++		(LPCWSTR)&LoadNvda, &self ) )
++	{
++		DWORD len = GetModuleFileNameW( self, path, MAX_PATH );
++		wchar_t *slash = len > 0 && len < MAX_PATH ? wcsrchr( path, L'\\' ) : NULL;
++		if( slash && ( slash - path ) + 32 < MAX_PATH )
++		{
++			wcscpy( slash + 1, L"nvdaControllerClient.dll" );
++			lib = LoadLibraryW( path );
++		}
++	}
++	if( !lib )
++		lib = LoadLibraryW( L"nvdaControllerClient.dll" );
++	if( !lib )
++		return;
++
++	s_pfnSpeakText = (nvdaSpeakText_t)GetProcAddress( lib, "nvdaController_speakText" );
++	s_pfnCancelSpeech = (nvdaCancelSpeech_t)GetProcAddress( lib, "nvdaController_cancelSpeech" );
++	if( !s_pfnSpeakText )
++		FreeLibrary( lib );
++}
++
++void AccessTts_Log( const char *utf8 )
++{
++	LogUtterance( utf8, 2 );
++}
++
++int AccessTts_Speak( const char *utf8, int interrupt )
++{
++	wchar_t wide[2048];
++	int n;
++
++	if( !utf8 || !utf8[0] )
++		return ACCESS_TTS_OK;
++
++	LogUtterance( utf8, interrupt );
++	LoadNvda();
++	if( !s_pfnSpeakText )
++		return ACCESS_TTS_UNAVAILABLE;
++
++	n = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, (int)( sizeof( wide ) / sizeof( wide[0] ) ) );
++	if( n == 0 )
++		n = MultiByteToWideChar( CP_ACP, 0, utf8, -1, wide, (int)( sizeof( wide ) / sizeof( wide[0] ) ) );
++	if( n == 0 )
++		return ACCESS_TTS_OK;	// too long or unconvertible: drop silently
++	wide[sizeof( wide ) / sizeof( wide[0] ) - 1] = 0;
++
++	if( interrupt && s_pfnCancelSpeech )
++		s_pfnCancelSpeech();
++
++	return s_pfnSpeakText( wide ) == 0 ? ACCESS_TTS_OK : ACCESS_TTS_NOT_RUNNING;
++}
++
++void AccessTts_Cancel( void )
++{
++	LoadNvda();
++	if( s_pfnCancelSpeech )
++		s_pfnCancelSpeech();
++}
++
++unsigned int AccessTts_Ticks( void )
++{
++	return (unsigned int)GetTickCount();
++}
++
++#else // !_WIN32
++
++void AccessTts_Log( const char *utf8 )
++{
++	(void)utf8;
++}
++
++#include <time.h>
++
++int AccessTts_Speak( const char *utf8, int interrupt )
++{
++	(void)utf8;
++	(void)interrupt;
++	return ACCESS_TTS_UNAVAILABLE;
++}
++
++void AccessTts_Cancel( void )
++{
++}
++
++unsigned int AccessTts_Ticks( void )
++{
++	struct timespec ts;
++	clock_gettime( CLOCK_MONOTONIC, &ts );
++	return (unsigned int)( ts.tv_sec * 1000u + ts.tv_nsec / 1000000u );
++}
++
++#endif
+diff --git a/engine/client/accessibility/access_tts.h b/engine/client/accessibility/access_tts.h
+new file mode 100644
+index 0000000..14ddaef
+--- /dev/null
++++ b/engine/client/accessibility/access_tts.h
+@@ -0,0 +1,36 @@
++/*
++access_tts.h - minimal screen reader output (NVDA controller client), shared by
++the client (client.dll), the menus (menu.dll) and the engine (xash.dll).
++
++Plain C and free of engine headers, so it can be dropped into any of the three
++code bases; nvdaControllerClient.dll is loaded at runtime from the module's own
++folder, then from the normal DLL search path.
++*/
++#ifndef ACCESS_TTS_H
++#define ACCESS_TTS_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum
++{
++	ACCESS_TTS_OK = 1,
++	ACCESS_TTS_NOT_RUNNING = 0,		// DLL loaded but NVDA did not accept the text
++	ACCESS_TTS_UNAVAILABLE = -1		// no nvdaControllerClient.dll / unsupported platform
++};
++
++// Speaks UTF-8 text (invalid UTF-8 falls back to the ANSI code page).
++// interrupt != 0 cancels whatever is being spoken first.
++int AccessTts_Speak( const char *utf8, int interrupt );
++void AccessTts_Cancel( void );
++// Millisecond tick counter (wraps; compare with signed differences).
++unsigned int AccessTts_Ticks( void );
++// Writes a diagnostic line to the ACCESS_TTS_LOG transcript only (never spoken).
++void AccessTts_Log( const char *utf8 );
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // ACCESS_TTS_H
+diff --git a/engine/client/accessibility/con_access.c b/engine/client/accessibility/con_access.c
+new file mode 100644
+index 0000000..7669206
+--- /dev/null
++++ b/engine/client/accessibility/con_access.c
+@@ -0,0 +1,168 @@
++/*
++con_access.c - screen reader support for the console and the chat input line
++
++The console and chat fields are drawn by the engine and invisible to NVDA.
++Their state is compared once per frame and the differences are spoken, the
++same way the menus do it (mainui menu_access.cpp).
++*/
++
++#include "common.h"
++#include "client.h"
++#include "accessibility/con_access.h"
++#include "accessibility/access_tts.h"
++
++static int s_lastKeyDest = -1;
++static char s_lastBuffer[MAX_STRING];
++static int s_lastCursor;
++static qboolean s_chatSent;
++
++// Copies text without ^N colour codes and control characters.
++static void CleanText( const char *in, char *out, size_t size )
++{
++	size_t o = 0;
++
++	for( ; *in && o + 1 < size; in++ )
++	{
++		if( *in == '^' && in[1] >= '0' && in[1] <= '9' )
++		{
++			in++;
++			continue;
++		}
++		out[o++] = (unsigned char)*in < 0x20 ? ' ' : *in;
++	}
++	out[o] = 0;
++}
++
++static int Utf8Len( const char *p )
++{
++	const unsigned char c = (unsigned char)*p;
++
++	if( c < 0x80 ) return 1;
++	if(( c & 0xE0 ) == 0xC0 ) return 2;
++	if(( c & 0xF0 ) == 0xE0 ) return 3;
++	if(( c & 0xF8 ) == 0xF0 ) return 4;
++	return 1;
++}
++
++static void DescribeChars( const char *text, int len, char *out, size_t size )
++{
++	if( len == 1 && text[0] == ' ' )
++		Q_strncpy( out, "espace", size );
++	else Q_snprintf( out, size, "%.*s", len, text );
++}
++
++// Says what changed in an edit field since the last frame.
++static void AnnounceEdit( const field_t *field )
++{
++	const char *now = field->buffer;
++	const size_t lenNow = Q_strlen( now ), lenBefore = Q_strlen( s_lastBuffer );
++	char spoken[MAX_STRING + 32];
++
++	spoken[0] = 0;
++
++	if( Q_strcmp( now, s_lastBuffer ))
++	{
++		size_t prefix = 0, suffix = 0;
++		int added, removed;
++
++		while( prefix < lenNow && prefix < lenBefore && now[prefix] == s_lastBuffer[prefix] )
++			prefix++;
++		while( suffix < lenNow - prefix && suffix < lenBefore - prefix && now[lenNow - 1 - suffix] == s_lastBuffer[lenBefore - 1 - suffix] )
++			suffix++;
++
++		added = (int)( lenNow - prefix - suffix );
++		removed = (int)( lenBefore - prefix - suffix );
++
++		if( added > 0 && removed == 0 && added <= 4 )
++			DescribeChars( now + prefix, added, spoken, sizeof( spoken ));
++		else if( removed > 1 && added == 0 && lenNow == 0 )
++		{
++			// Field cleared after Enter (command run) or Ctrl+C: nothing to spell.
++		}
++		else if( removed > 0 && added == 0 )
++		{
++			char ch[64];
++			DescribeChars( s_lastBuffer + prefix, removed, ch, sizeof( ch ));
++			Q_snprintf( spoken, sizeof( spoken ), "%s effacé", ch );
++		}
++		else
++		{
++			// Replaced wholesale: history recall, tab completion, paste.
++			CleanText( lenNow ? now : "vide", spoken, sizeof( spoken ));
++		}
++	}
++	else if( field->cursor != s_lastCursor )
++	{
++		if( field->cursor >= 0 && (size_t)field->cursor < lenNow )
++			DescribeChars( now + field->cursor, Utf8Len( now + field->cursor ), spoken, sizeof( spoken ));
++		else Q_strncpy( spoken, "fin", sizeof( spoken ));
++	}
++
++	if( spoken[0] )
++		AccessTts_Speak( spoken, 1 );
++
++	Q_strncpy( s_lastBuffer, now, sizeof( s_lastBuffer ));
++	s_lastCursor = field->cursor;
++}
++
++static void Remember( const field_t *field )
++{
++	Q_strncpy( s_lastBuffer, field ? field->buffer : "", sizeof( s_lastBuffer ));
++	s_lastCursor = field ? field->cursor : 0;
++}
++
++void ConAccess_Frame( const field_t *input, const field_t *chat, const char *chatCmd )
++{
++	const int dest = cls.key_dest;
++
++	if( dest != s_lastKeyDest )
++	{
++		if( s_lastKeyDest == key_console && dest != key_console )
++			AccessTts_Speak( "Console fermée", 1 );
++		else if( s_lastKeyDest == key_message && dest != key_message )
++			AccessTts_Speak( s_chatSent ? "Message envoyé" : "Message annulé", 1 );
++
++		if( dest == key_console )
++		{
++			AccessTts_Speak( "Console. Tapez une commande puis Entrée. Flèches haut et bas pour l'historique, "
++				"Tab pour compléter, Échap pour fermer.", 1 );
++			Remember( input );
++		}
++		else if( dest == key_message )
++		{
++			const qboolean team = chatCmd && !Q_stricmp( chatCmd, "say_team" );
++			AccessTts_Speak( team ? "Message à votre équipe. Tapez puis Entrée, Échap pour annuler."
++				: "Message à tous. Tapez puis Entrée, Échap pour annuler.", 1 );
++			Remember( chat );
++		}
++
++		s_chatSent = false;
++		s_lastKeyDest = dest;
++		return;
++	}
++
++	if( dest == key_console )
++		AnnounceEdit( input );
++	else if( dest == key_message )
++		AnnounceEdit( chat );
++}
++
++void ConAccess_OnLine( const char *text )
++{
++	char clean[MAX_STRING];
++
++	if( cls.key_dest != key_console || !text || !text[0] )
++		return;
++	// The command the user just typed is echoed as ">command": already known.
++	if( text[0] == '>' )
++		return;
++
++	CleanText( text, clean, sizeof( clean ));
++	if( clean[0] && clean[strspn( clean, " " )] )
++		AccessTts_Speak( clean, 0 );
++}
++
++void ConAccess_OnChatSent( void )
++{
++	s_chatSent = true;
++}
+diff --git a/engine/client/accessibility/con_access.h b/engine/client/accessibility/con_access.h
+new file mode 100644
+index 0000000..ebd4731
+--- /dev/null
++++ b/engine/client/accessibility/con_access.h
+@@ -0,0 +1,15 @@
++/*
++con_access.h - screen reader support for the console and the chat input line
++*/
++#ifndef CON_ACCESS_H
++#define CON_ACCESS_H
++
++// Per frame: announces console / chat opening and closing, and echoes edits
++// (typed and deleted characters, character under the cursor, recalled history).
++void ConAccess_Frame( const field_t *input, const field_t *chat, const char *chatCmd );
++// A console line was printed (spoken only while the console is open).
++void ConAccess_OnLine( const char *text );
++// The chat line was sent with Enter.
++void ConAccess_OnChatSent( void );
++
++#endif // CON_ACCESS_H
+diff --git a/engine/client/console.c b/engine/client/console.c
+index 62ac3eb..47bb11d 100644
+--- a/engine/client/console.c
++++ b/engine/client/console.c
+@@ -22,6 +22,7 @@ GNU General Public License for more details.
+ #include "wadfile.h"
+ #include "input.h"
+ #include "utflib.h"
++#include "accessibility/con_access.h"
+ 
+ static CVAR_DEFINE_AUTO( scr_conspeed, "600", FCVAR_ARCHIVE, "console moving speed" );
+ static CVAR_DEFINE_AUTO( con_notifytime, "3", FCVAR_ARCHIVE, "notify time to live" );
+@@ -438,6 +439,7 @@ static void Con_AddLine( const char *line, int length, qboolean newline )
+ 		memcpy( putpos, line, length );
+ 		putpos[length - 1] = '\0';
+ 		con.lines_count++;
++		ConAccess_OnLine( putpos );
+ 
+ 		p = &CON_LINES_LAST();
+ 		p->start = putpos;
+@@ -1648,6 +1650,7 @@ void Key_Message( int key )
+ 			if( g_messagemode_privileged )
+ 				Cbuf_AddText( buffer );
+ 			else Cbuf_AddFilteredText( buffer );
++			ConAccess_OnChatSent();
+ 		}
+ 
+ 		Key_SetKeyDest( key_game );
+@@ -2167,6 +2170,8 @@ Scroll it up or down
+ */
+ void Con_RunConsole( void )
+ {
++	ConAccess_Frame( &con.input, &con.chat, con.chat_cmd );
++
+ 	Con_SetColor( );
+ 
+ 	con.showlines = Con_DestHeight();

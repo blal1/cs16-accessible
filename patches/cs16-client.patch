@@ -1,0 +1,3806 @@
+diff --git a/cl_dll/CMakeLists.txt b/cl_dll/CMakeLists.txt
+index b0af818..ea4aa1d 100644
+--- a/cl_dll/CMakeLists.txt
++++ b/cl_dll/CMakeLists.txt
+@@ -14,6 +14,7 @@ file(GLOB CS_PM_SRC "../pm_shared/*.cpp")
+ file(GLOB CS_GAMSH_SRC "../game_shared/*.cpp")
+ file(GLOB MINIUTL_SRC "../3rdparty/mainui_cpp/miniutl/*.cpp")
+ file(GLOB CS_PARTICLEMAN_SRC "particleman/*.cpp")
++file(GLOB CS_ACCESS_SRC "accessibility/*.cpp" "accessibility/*.c")
+ 
+ list(REMOVE_ITEM CS_CLIENT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/ev_hldm.cpp")
+ list(REMOVE_ITEM CS_INPUT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/input/input_sdl.cpp")
+@@ -38,6 +39,7 @@ list(APPEND CS_CLIENT_SRC ${CS_EV_SRC})
+ list(APPEND CS_CLIENT_SRC ${CS_WPN_SRC})
+ list(APPEND CS_CLIENT_SRC ${CS_WPNSH_SRC})
+ list(APPEND CS_CLIENT_SRC ${CS_HUD_SRC})
++list(APPEND CS_CLIENT_SRC ${CS_ACCESS_SRC})
+ list(APPEND CS_CLIENT_SRC ${CS_STUDIO_SRC})
+ list(APPEND CS_CLIENT_SRC ${CS_PM_SRC})
+ list(APPEND CS_CLIENT_SRC ${CS_INPUT_SRC})
+diff --git a/cl_dll/accessibility/access_audio.cpp b/cl_dll/accessibility/access_audio.cpp
+new file mode 100644
+index 0000000..717c118
+--- /dev/null
++++ b/cl_dll/accessibility/access_audio.cpp
+@@ -0,0 +1,410 @@
++/*
++access_audio.cpp - procedurally synthesized audio cues (XAudio2)
++
++Deliberately engine-free: this file only sees Windows and XAudio2, so it can
++raise _WIN32_WINNT for xaudio2.h without touching the rest of the client.
++xaudio2_9.dll ships with Windows 10+ and is loaded at runtime; without it the
++cues are silently disabled.
++*/
++
++#undef _WIN32_WINNT
++#define _WIN32_WINNT 0x0A00
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#define XAUDIO2_HELPER_FUNCTIONS
++#include <xaudio2.h>
++
++#include <math.h>
++#include <string.h>
++#include <vector>
++
++#include "access_audio.h"
++
++#pragma comment( lib, "ole32.lib" )
++
++static const UINT32 SAMPLE_RATE = 44100;
++static const int VOICE_COUNT = 32;
++static const float PI_F = 3.14159265358979f;
++
++typedef HRESULT ( __stdcall *XAudio2Create_t )( IXAudio2 **ppXAudio2, UINT32 flags, XAUDIO2_PROCESSOR processor );
++
++struct CueVoice
++{
++	IXAudio2SourceVoice *voice;
++	DWORD startTick;
++};
++
++static HMODULE s_hXAudio;
++static IXAudio2 *s_pEngine;
++static IXAudio2MasteringVoice *s_pMaster;
++static CueVoice s_Voices[VOICE_COUNT];
++static std::vector<float> s_Cues[CUE_COUNT];
++static float s_flMasterVolume = 0.8f;
++static bool s_bInitTried;
++
++// XAudio2's mastering voice needs COM. The game thread's apartment belongs to the
++// engine, so a dedicated thread joins the multithreaded apartment, owns creation
++// and teardown, and keeps the MTA alive; XAudio2 calls from other threads are safe.
++static HANDLE s_hAudioThread;
++static HANDLE s_hReadyEvent;
++static HANDLE s_hQuitEvent;
++static bool s_bThreadInitOk;
++
++// ---------------------------------------------------------------------------
++// Synthesis helpers. All cues are mono float PCM at SAMPLE_RATE.
++// ---------------------------------------------------------------------------
++
++static unsigned int s_NoiseState = 0x12345678u;
++
++static float Noise( void )
++{
++	s_NoiseState ^= s_NoiseState << 13;
++	s_NoiseState ^= s_NoiseState >> 17;
++	s_NoiseState ^= s_NoiseState << 5;
++	return (float)( s_NoiseState & 0xFFFFFF ) / (float)0x7FFFFF - 1.0f;
++}
++
++// Linear attack then exponential decay reaching ~e^-decayRate at the end, with a
++// 3 ms fade-out so buffers never end on a click.
++static float Envelope( float t, float attack, float duration, float decayRate )
++{
++	float e;
++	if( t < attack )
++		e = t / attack;
++	else
++		e = expf( -decayRate * ( t - attack ) / ( duration - attack ) );
++
++	const float fadeOut = 0.003f;
++	if( t > duration - fadeOut )
++		e *= ( duration - t ) / fadeOut;
++	return e < 0.0f ? 0.0f : e;
++}
++
++static int Samples( float seconds )
++{
++	return (int)( seconds * SAMPLE_RATE );
++}
++
++// Appends a tone whose frequency glides exponentially from f0 to f1.
++// harmonics[] gives the relative amplitude of partials 1..n.
++static void AddTone( std::vector<float> &out, int offset, float duration, float f0, float f1,
++	const float *harmonics, int harmonicCount, float attack, float decayRate, float gain )
++{
++	const int n = Samples( duration );
++	if( (int)out.size() < offset + n )
++		out.resize( offset + n, 0.0f );
++
++	double phase = 0.0;
++	for( int i = 0; i < n; i++ )
++	{
++		const float t = (float)i / SAMPLE_RATE;
++		const float f = f0 * powf( f1 / f0, t / duration );
++		phase += 2.0 * PI_F * f / SAMPLE_RATE;
++
++		float s = 0.0f;
++		for( int h = 0; h < harmonicCount; h++ )
++			s += harmonics[h] * sinf( (float)( phase * ( h + 1 ) ) );
++
++		out[offset + i] += s * gain * Envelope( t, attack, duration, decayRate );
++	}
++}
++
++// Appends band-limited noise (one-pole high-pass then low-pass).
++static void AddNoise( std::vector<float> &out, int offset, float duration, float highPassHz, float lowPassHz,
++	float attack, float decayRate, float gain )
++{
++	const int n = Samples( duration );
++	if( (int)out.size() < offset + n )
++		out.resize( offset + n, 0.0f );
++
++	const float hpA = expf( -2.0f * PI_F * highPassHz / SAMPLE_RATE );
++	const float lpA = expf( -2.0f * PI_F * lowPassHz / SAMPLE_RATE );
++	float hpLow = 0.0f, lp = 0.0f;
++
++	for( int i = 0; i < n; i++ )
++	{
++		const float t = (float)i / SAMPLE_RATE;
++		const float x = Noise();
++		hpLow = hpA * hpLow + ( 1.0f - hpA ) * x;
++		const float hp = x - hpLow;
++		lp = lpA * lp + ( 1.0f - lpA ) * hp;
++		out[offset + i] += lp * gain * Envelope( t, attack, duration, decayRate );
++	}
++}
++
++static void Normalize( std::vector<float> &buf, float peak )
++{
++	float m = 0.0f;
++	for( float s : buf )
++		m = fabsf( s ) > m ? fabsf( s ) : m;
++	if( m > 0.0f )
++		for( float &s : buf )
++			s *= peak / m;
++}
++
++static void BuildCues( void )
++{
++	static const float pure[] = { 1.0f };
++	static const float warm[] = { 1.0f, 0.3f };
++	static const float soft_square[] = { 1.0f, 0.0f, 0.33f, 0.0f, 0.2f };
++	static const float chirp[] = { 1.0f, 0.0f, 0.25f };
++
++	// Cane-like tap: short bright noise burst.
++	AddNoise( s_Cues[CUE_WALL_TAP], 0, 0.030f, 1500.0f, 5500.0f, 0.001f, 7.0f, 1.0f );
++
++	// Same tap with a ringing partial, so "wall ahead" is distinct from "wall beside".
++	AddNoise( s_Cues[CUE_WALL_FRONT], 0, 0.030f, 1500.0f, 5500.0f, 0.001f, 7.0f, 1.0f );
++	AddTone( s_Cues[CUE_WALL_FRONT], 0, 0.060f, 1400.0f, 1400.0f, pure, 1, 0.001f, 6.0f, 0.6f );
++
++	AddTone( s_Cues[CUE_LEDGE], 0, 0.170f, 900.0f, 240.0f, chirp, 3, 0.005f, 2.5f, 1.0f );
++	AddTone( s_Cues[CUE_STEP], 0, 0.110f, 380.0f, 950.0f, chirp, 3, 0.005f, 2.5f, 1.0f );
++
++	// Bell: inharmonic partial decays faster than the fundamental.
++	AddTone( s_Cues[CUE_BEACON], 0, 0.300f, 880.0f, 880.0f, warm, 2, 0.002f, 4.0f, 1.0f );
++	AddTone( s_Cues[CUE_BEACON], 0, 0.120f, 880.0f * 2.76f, 880.0f * 2.76f, pure, 1, 0.001f, 5.0f, 0.35f );
++
++	// Major arpeggio C5 E5 G5 C6.
++	const float notes[] = { 523.25f, 659.25f, 783.99f, 1046.5f };
++	for( int i = 0; i < 4; i++ )
++		AddTone( s_Cues[CUE_ARRIVED], Samples( 0.09f * i ), i == 3 ? 0.35f : 0.12f, notes[i], notes[i], warm, 2, 0.004f, 3.0f, 1.0f );
++
++	// Two-tone alert (falling fourth) with a buzzy timbre.
++	AddTone( s_Cues[CUE_ENEMY], 0, 0.100f, 440.0f, 440.0f, soft_square, 5, 0.004f, 1.5f, 1.0f );
++	AddTone( s_Cues[CUE_ENEMY], Samples( 0.100f ), 0.110f, 330.0f, 330.0f, soft_square, 5, 0.004f, 2.0f, 1.0f );
++
++	AddTone( s_Cues[CUE_TEAMMATE], 0, 0.070f, 520.0f, 520.0f, warm, 2, 0.006f, 3.0f, 1.0f );
++
++	AddTone( s_Cues[CUE_AIM], 0, 0.045f, 660.0f, 660.0f, pure, 1, 0.003f, 2.0f, 1.0f );
++
++	AddNoise( s_Cues[CUE_AIM_LOCK], 0, 0.004f, 2000.0f, 9000.0f, 0.0005f, 3.0f, 0.8f );
++	AddTone( s_Cues[CUE_AIM_LOCK], 0, 0.055f, 1760.0f, 1760.0f, warm, 2, 0.001f, 4.0f, 0.9f );
++
++	// Marimba: fundamental plus a quickly damped 4th partial.
++	AddTone( s_Cues[CUE_OBJECTIVE], 0, 0.320f, 587.33f, 587.33f, pure, 1, 0.002f, 5.0f, 1.0f );
++	AddTone( s_Cues[CUE_OBJECTIVE], 0, 0.060f, 587.33f * 4.0f, 587.33f * 4.0f, pure, 1, 0.001f, 6.0f, 0.4f );
++
++	AddTone( s_Cues[CUE_NORTH], 0, 0.025f, 1900.0f, 1900.0f, pure, 1, 0.0005f, 8.0f, 1.0f );
++	AddNoise( s_Cues[CUE_NORTH], 0, 0.006f, 1000.0f, 6000.0f, 0.0005f, 4.0f, 0.4f );
++
++	AddTone( s_Cues[CUE_SCAN], 0, 0.060f, 700.0f, 700.0f, pure, 1, 0.003f, 3.0f, 1.0f );
++
++	AddNoise( s_Cues[CUE_OPENING], 0, 0.160f, 300.0f, 1800.0f, 0.040f, 2.0f, 1.0f );
++
++	// Thud: pitched-down sine sweep with a noise transient.
++	AddTone( s_Cues[CUE_DAMAGE], 0, 0.180f, 160.0f, 55.0f, warm, 2, 0.002f, 3.0f, 1.0f );
++	AddNoise( s_Cues[CUE_DAMAGE], 0, 0.020f, 100.0f, 1200.0f, 0.001f, 4.0f, 0.6f );
++
++	// Rattle: 6 quick metallic ticks.
++	for( int i = 0; i < 6; i++ )
++	{
++		AddNoise( s_Cues[CUE_GRENADE], Samples( 0.035f * i ), 0.020f, 3000.0f, 9000.0f, 0.0005f, 6.0f, 1.0f );
++		AddTone( s_Cues[CUE_GRENADE], Samples( 0.035f * i ), 0.025f, 2600.0f, 2600.0f, pure, 1, 0.0005f, 7.0f, 0.5f );
++	}
++
++	AddTone( s_Cues[CUE_HEARTBEAT], 0, 0.110f, 70.0f, 50.0f, warm, 2, 0.004f, 3.0f, 1.0f );
++	AddTone( s_Cues[CUE_HEARTBEAT], Samples( 0.170f ), 0.120f, 60.0f, 45.0f, warm, 2, 0.004f, 3.0f, 0.8f );
++
++	AddNoise( s_Cues[CUE_AMMO_LOW], 0, 0.012f, 2500.0f, 7000.0f, 0.0005f, 5.0f, 1.0f );
++	AddNoise( s_Cues[CUE_AMMO_LOW], Samples( 0.060f ), 0.012f, 2500.0f, 7000.0f, 0.0005f, 5.0f, 0.8f );
++
++	AddTone( s_Cues[CUE_ENEMY_SPOTTED], 0, 0.080f, 600.0f, 1500.0f, soft_square, 5, 0.002f, 2.0f, 1.0f );
++
++	for( int i = 0; i < CUE_COUNT; i++ )
++		Normalize( s_Cues[i], 0.8f );
++}
++
++// ---------------------------------------------------------------------------
++// Playback
++// ---------------------------------------------------------------------------
++
++static void ReleaseEngine( void );
++
++static bool CreateEngine( void )
++{
++	s_hXAudio = LoadLibraryW( L"xaudio2_9.dll" );
++	if( !s_hXAudio )
++		return false;
++
++	XAudio2Create_t pfnCreate = (XAudio2Create_t)GetProcAddress( s_hXAudio, "XAudio2Create" );
++	if( !pfnCreate || FAILED( pfnCreate( &s_pEngine, 0, XAUDIO2_DEFAULT_PROCESSOR ) ) )
++	{
++		ReleaseEngine();
++		return false;
++	}
++
++	// Force a stereo mix so panning maps 1:1 to headphones.
++	if( FAILED( s_pEngine->CreateMasteringVoice( &s_pMaster, 2, SAMPLE_RATE ) ) )
++	{
++		ReleaseEngine();
++		return false;
++	}
++
++	WAVEFORMATEX wfx = {};
++	wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
++	wfx.nChannels = 1;
++	wfx.nSamplesPerSec = SAMPLE_RATE;
++	wfx.wBitsPerSample = 32;
++	wfx.nBlockAlign = 4;
++	wfx.nAvgBytesPerSec = SAMPLE_RATE * 4;
++
++	for( int i = 0; i < VOICE_COUNT; i++ )
++	{
++		if( FAILED( s_pEngine->CreateSourceVoice( &s_Voices[i].voice, &wfx, XAUDIO2_VOICE_USEFILTER, 4.0f ) ) )
++			s_Voices[i].voice = NULL;
++	}
++
++	BuildCues();
++	return true;
++}
++
++static DWORD WINAPI AudioThread( LPVOID )
++{
++	const HRESULT com = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++	s_bThreadInitOk = SUCCEEDED( com ) && CreateEngine();
++	SetEvent( s_hReadyEvent );
++
++	if( s_bThreadInitOk )
++		WaitForSingleObject( s_hQuitEvent, INFINITE );
++
++	ReleaseEngine();
++	if( SUCCEEDED( com ) )
++		CoUninitialize();
++	return 0;
++}
++
++bool AccessAudio_Init( void )
++{
++	if( s_bInitTried )
++		return s_pMaster != NULL;
++	s_bInitTried = true;
++
++	s_hReadyEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++	s_hQuitEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++	if( !s_hReadyEvent || !s_hQuitEvent )
++		return false;
++
++	s_hAudioThread = CreateThread( NULL, 0, AudioThread, NULL, 0, NULL );
++	if( !s_hAudioThread || WaitForSingleObject( s_hReadyEvent, 5000 ) != WAIT_OBJECT_0 )
++		return false;
++	return s_bThreadInitOk;
++}
++
++void AccessAudio_Shutdown( void )
++{
++	if( s_hAudioThread )
++	{
++		SetEvent( s_hQuitEvent );
++		WaitForSingleObject( s_hAudioThread, 5000 );
++		CloseHandle( s_hAudioThread );
++		s_hAudioThread = NULL;
++	}
++	if( s_hReadyEvent )
++	{
++		CloseHandle( s_hReadyEvent );
++		s_hReadyEvent = NULL;
++	}
++	if( s_hQuitEvent )
++	{
++		CloseHandle( s_hQuitEvent );
++		s_hQuitEvent = NULL;
++	}
++}
++
++static void ReleaseEngine( void )
++{
++	for( int i = 0; i < VOICE_COUNT; i++ )
++	{
++		if( s_Voices[i].voice )
++		{
++			s_Voices[i].voice->DestroyVoice();
++			s_Voices[i].voice = NULL;
++		}
++	}
++	if( s_pMaster )
++	{
++		s_pMaster->DestroyVoice();
++		s_pMaster = NULL;
++	}
++	if( s_pEngine )
++	{
++		s_pEngine->Release();
++		s_pEngine = NULL;
++	}
++	if( s_hXAudio )
++	{
++		FreeLibrary( s_hXAudio );
++		s_hXAudio = NULL;
++	}
++}
++
++bool AccessAudio_IsReady( void )
++{
++	return s_pMaster != NULL;
++}
++
++void AccessAudio_SetMasterVolume( float volume )
++{
++	s_flMasterVolume = volume < 0.0f ? 0.0f : ( volume > 2.0f ? 2.0f : volume );
++}
++
++static float Clamp( float v, float lo, float hi )
++{
++	return v < lo ? lo : ( v > hi ? hi : v );
++}
++
++void AccessAudio_Play( AccessCue cue, const AccessCueParams &params )
++{
++	if( !s_pMaster || cue < 0 || cue >= CUE_COUNT || s_Cues[cue].empty() )
++		return;
++
++	const float gain = Clamp( params.gain, 0.0f, 1.0f ) * s_flMasterVolume;
++	if( gain <= 0.001f )
++		return;
++
++	// Free voice first; otherwise steal the one that started longest ago.
++	CueVoice *slot = NULL;
++	for( int i = 0; i < VOICE_COUNT; i++ )
++	{
++		if( !s_Voices[i].voice )
++			continue;
++		XAUDIO2_VOICE_STATE state;
++		s_Voices[i].voice->GetState( &state, XAUDIO2_VOICE_NOSAMPLESPLAYED );
++		if( state.BuffersQueued == 0 )
++		{
++			slot = &s_Voices[i];
++			break;
++		}
++		if( !slot || (LONG)( s_Voices[i].startTick - slot->startTick ) < 0 )
++			slot = &s_Voices[i];
++	}
++	if( !slot )
++		return;
++
++	IXAudio2SourceVoice *v = slot->voice;
++	v->Stop( 0 );
++	v->FlushSourceBuffers();
++
++	XAUDIO2_BUFFER buffer = {};
++	buffer.Flags = XAUDIO2_END_OF_STREAM;
++	buffer.AudioBytes = (UINT32)( s_Cues[cue].size() * sizeof( float ) );
++	buffer.pAudioData = (const BYTE *)s_Cues[cue].data();
++	if( FAILED( v->SubmitSourceBuffer( &buffer ) ) )
++		return;
++
++	// Equal-power pan.
++	const float angle = ( Clamp( params.pan, -1.0f, 1.0f ) + 1.0f ) * PI_F * 0.25f;
++	float matrix[2] = { cosf( angle ) * gain, sinf( angle ) * gain };
++	v->SetOutputMatrix( s_pMaster, 1, 2, matrix );
++
++	const float muffle = Clamp( params.muffle, 0.0f, 1.0f );
++	v->SetFrequencyRatio( Clamp( params.pitch * ( 1.0f - 0.06f * muffle ), 0.25f, 4.0f ) );
++
++	XAUDIO2_FILTER_PARAMETERS filter;
++	filter.Type = LowPassFilter;
++	filter.Frequency = XAudio2CutoffFrequencyToRadians( 16000.0f - 14800.0f * muffle, SAMPLE_RATE );
++	filter.OneOverQ = 1.0f;
++	v->SetFilterParameters( &filter );
++
++	slot->startTick = GetTickCount();
++	v->Start( 0 );
++}
+diff --git a/cl_dll/accessibility/access_audio.h b/cl_dll/accessibility/access_audio.h
+new file mode 100644
+index 0000000..f238b9d
+--- /dev/null
++++ b/cl_dll/accessibility/access_audio.h
+@@ -0,0 +1,45 @@
++/*
++access_audio.h - procedurally synthesized audio cues (XAudio2), independent of the engine sound system
++*/
++#pragma once
++
++// Every cue is synthesized once at startup; see BuildCues() for the recipes.
++enum AccessCue
++{
++	CUE_WALL_TAP = 0,	// short filtered-noise tap: wall to the side
++	CUE_WALL_FRONT,		// tap with a tonal ring: wall in front
++	CUE_LEDGE,			// falling chirp: drop ahead
++	CUE_STEP,			// rising chirp: obstacle low enough to jump over
++	CUE_BEACON,			// bell: next guidance waypoint
++	CUE_ARRIVED,		// rising arpeggio: guidance target reached
++	CUE_ENEMY,			// two-tone buzz: visible enemy
++	CUE_TEAMMATE,		// soft blip: nearby teammate
++	CUE_AIM,			// pure tone, pitched by aim error
++	CUE_AIM_LOCK,		// bright click: crosshair on target
++	CUE_OBJECTIVE,		// marimba: objective (bomb) beacon
++	CUE_NORTH,			// wood tick: compass north crossing
++	CUE_SCAN,			// sine blip, pitched by distance: radar sweep wall echo
++	CUE_OPENING,		// breathy noise: radar sweep finds open space (corridor, door)
++	CUE_DAMAGE,			// low thud: you were hit, from that direction
++	CUE_GRENADE,		// rattle: live grenade nearby
++	CUE_HEARTBEAT,		// double thump: health critical
++	CUE_AMMO_LOW,		// dry click: magazine almost empty
++	CUE_ENEMY_SPOTTED,	// sharp rising blip: an enemy just came into view
++
++	CUE_COUNT
++};
++
++// Spatial parameters, already resolved relative to the listener.
++struct AccessCueParams
++{
++	float pan;		// -1 = hard left, +1 = hard right
++	float gain;		// 0..1, multiplied by the master volume
++	float pitch;	// frequency ratio, 1 = unchanged (clamped to 0.25..4)
++	float muffle;	// 0 = in front, 1 = directly behind (low-pass + slight dulling)
++};
++
++bool AccessAudio_Init( void );
++void AccessAudio_Shutdown( void );
++bool AccessAudio_IsReady( void );
++void AccessAudio_SetMasterVolume( float volume );
++void AccessAudio_Play( AccessCue cue, const AccessCueParams &params );
+diff --git a/cl_dll/accessibility/access_map.cpp b/cl_dll/accessibility/access_map.cpp
+new file mode 100644
+index 0000000..861de0f
+--- /dev/null
++++ b/cl_dll/accessibility/access_map.cpp
+@@ -0,0 +1,618 @@
++/*
++access_map.cpp - map knowledge for navigation
++
++Formats:
++- BSP v30: entity lump (0) for objectives, model lump (14) for brush-entity
++  bounds (func_bomb_target & co. only carry "model" "*N").
++- CS bot nav mesh, versions 1-5, as written by ReGameDLL game_shared/bot/nav_file.cpp.
++  Stock 1.6 maps ship version 5 files without place names.
++
++Build with ACCESS_MAP_STANDALONE to test the parsers outside the engine.
++*/
++
++#include "access_map.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <queue>
++#include <string>
++#include <unordered_map>
++
++#ifndef ACCESS_MAP_STANDALONE
++#include "hud.h"
++#include "cl_util.h"
++#endif
++
++struct NavArea
++{
++	unsigned int id;
++	unsigned char flags;
++	AccessVec lo, hi;		// lo = north-west corner, hi = south-east corner
++	float neZ, swZ;
++	AccessVec center;
++	std::vector<int> neighbors;	// indices into s_Areas
++};
++
++static const unsigned char NAV_JUMP = 0x02;
++
++static char s_szLevel[256];
++static std::vector<AccessObjective> s_Objectives;
++static std::vector<NavArea> s_Areas;
++
++// ---------------------------------------------------------------------------
++// Small helpers
++// ---------------------------------------------------------------------------
++
++static AccessVec MakeVec( float x, float y, float z )
++{
++	AccessVec v = { x, y, z };
++	return v;
++}
++
++static float Dist( const AccessVec &a, const AccessVec &b )
++{
++	const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
++	return sqrtf( dx * dx + dy * dy + dz * dz );
++}
++
++static float Clampf( float v, float lo, float hi )
++{
++	return v < lo ? lo : ( v > hi ? hi : v );
++}
++
++const char *AccessMap_CompassWord( float yaw )
++{
++	static const char *words[8] = { "est", "nord-est", "nord", "nord-ouest", "ouest", "sud-ouest", "sud", "sud-est" };
++	yaw = fmodf( yaw, 360.0f );
++	if( yaw < 0.0f )
++		yaw += 360.0f;
++	return words[(int)( ( yaw + 22.5f ) / 45.0f ) % 8];
++}
++
++// Bounds-checked little-endian reader.
++struct Reader
++{
++	const unsigned char *data;
++	size_t size;
++	size_t pos;
++	bool ok;
++
++	bool Read( void *dst, size_t n )
++	{
++		if( !ok || pos + n > size )
++		{
++			ok = false;
++			return false;
++		}
++		memcpy( dst, data + pos, n );
++		pos += n;
++		return true;
++	}
++	void Skip( size_t n )
++	{
++		if( !ok || pos + n > size )
++			ok = false;
++		else
++			pos += n;
++	}
++	unsigned int U32( void ) { unsigned int v = 0; Read( &v, 4 ); return v; }
++	unsigned short U16( void ) { unsigned short v = 0; Read( &v, 2 ); return v; }
++	unsigned char U8( void ) { unsigned char v = 0; Read( &v, 1 ); return v; }
++	float F32( void ) { float v = 0; Read( &v, 4 ); return v; }
++};
++
++// ---------------------------------------------------------------------------
++// BSP objectives
++// ---------------------------------------------------------------------------
++
++struct RawObjective
++{
++	AccessObjectiveType type;
++	AccessVec pos;
++};
++
++static bool ClassToType( const char *classname, AccessObjectiveType *type )
++{
++	static const struct { const char *name; AccessObjectiveType type; } map[] =
++	{
++		{ "func_bomb_target", OBJ_BOMBSITE }, { "info_bomb_target", OBJ_BOMBSITE },
++		{ "hostage_entity", OBJ_HOSTAGE },
++		{ "func_hostage_rescue", OBJ_RESCUE_ZONE }, { "info_hostage_rescue", OBJ_RESCUE_ZONE },
++		{ "func_vip_safetyzone", OBJ_VIP_SAFETY },
++		{ "func_escapezone", OBJ_ESCAPE_ZONE },
++		{ "info_player_start", OBJ_SPAWN_CT },
++		{ "info_player_deathmatch", OBJ_SPAWN_T },
++	};
++	for( size_t i = 0; i < sizeof( map ) / sizeof( map[0] ); i++ )
++	{
++		if( !strcmp( classname, map[i].name ) )
++		{
++			*type = map[i].type;
++			return true;
++		}
++	}
++	return false;
++}
++
++static void ParseBspObjectives( const unsigned char *bsp, size_t size, std::vector<RawObjective> &out )
++{
++	if( size < 4 + 15 * 8 )
++		return;
++
++	int version, lumps[15][2];
++	memcpy( &version, bsp, 4 );
++	memcpy( lumps, bsp + 4, sizeof( lumps ) );
++	if( version != 30 )
++		return;
++
++	const int entOfs = lumps[0][0], entLen = lumps[0][1];
++	const int modelOfs = lumps[14][0], modelLen = lumps[14][1];
++	if( entOfs < 0 || entLen <= 0 || (size_t)entOfs + entLen > size )
++		return;
++	const int modelCount = ( modelOfs >= 0 && modelLen > 0 && (size_t)modelOfs + modelLen <= size ) ? modelLen / 64 : 0;
++
++	std::string text( (const char *)bsp + entOfs, entLen );
++	size_t p = 0;
++	while( ( p = text.find( '{', p ) ) != std::string::npos )
++	{
++		const size_t end = text.find( '}', p );
++		if( end == std::string::npos )
++			break;
++
++		char classname[64] = "", model[16] = "", origin[64] = "";
++		size_t q = p + 1;
++		while( q < end )
++		{
++			// "key" "value"
++			const size_t k0 = text.find( '"', q );
++			if( k0 == std::string::npos || k0 >= end ) break;
++			const size_t k1 = text.find( '"', k0 + 1 );
++			if( k1 == std::string::npos || k1 >= end ) break;
++			const size_t v0 = text.find( '"', k1 + 1 );
++			if( v0 == std::string::npos || v0 >= end ) break;
++			const size_t v1 = text.find( '"', v0 + 1 );
++			if( v1 == std::string::npos || v1 >= end ) break;
++
++			const std::string key = text.substr( k0 + 1, k1 - k0 - 1 );
++			const std::string value = text.substr( v0 + 1, v1 - v0 - 1 );
++			if( key == "classname" )
++				snprintf( classname, sizeof( classname ), "%s", value.c_str() );
++			else if( key == "model" )
++				snprintf( model, sizeof( model ), "%s", value.c_str() );
++			else if( key == "origin" )
++				snprintf( origin, sizeof( origin ), "%s", value.c_str() );
++			q = v1 + 1;
++		}
++		p = end + 1;
++
++		RawObjective obj;
++		if( !ClassToType( classname, &obj.type ) )
++			continue;
++
++		obj.pos = MakeVec( 0, 0, 0 );
++		if( model[0] == '*' )
++		{
++			const int m = atoi( model + 1 );
++			if( m <= 0 || m >= modelCount )
++				continue;
++			float bounds[6];
++			memcpy( bounds, bsp + modelOfs + m * 64, sizeof( bounds ) );
++			obj.pos = MakeVec( ( bounds[0] + bounds[3] ) * 0.5f, ( bounds[1] + bounds[4] ) * 0.5f, ( bounds[2] + bounds[5] ) * 0.5f );
++		}
++		else if( sscanf( origin, "%f %f %f", &obj.pos.x, &obj.pos.y, &obj.pos.z ) != 3 )
++		{
++			continue;
++		}
++		out.push_back( obj );
++	}
++}
++
++// Names a group of same-type objectives by direction so they can be told apart:
++// two sites -> split on their widest axis ("est"/"ouest"); more -> 8-way compass.
++static void NameGroup( const std::vector<RawObjective> &raw, AccessObjectiveType type, const char *baseName )
++{
++	std::vector<const RawObjective *> group;
++	for( const RawObjective &r : raw )
++		if( r.type == type )
++			group.push_back( &r );
++	if( group.empty() )
++		return;
++
++	AccessVec c = MakeVec( 0, 0, 0 );
++	for( const RawObjective *r : group )
++	{
++		c.x += r->pos.x / group.size();
++		c.y += r->pos.y / group.size();
++	}
++
++	const bool xAxis = group.size() == 2 && fabsf( group[0]->pos.x - group[1]->pos.x ) >= fabsf( group[0]->pos.y - group[1]->pos.y );
++
++	for( size_t i = 0; i < group.size(); i++ )
++	{
++		AccessObjective o;
++		o.type = type;
++		o.pos = group[i]->pos;
++
++		if( group.size() == 1 )
++			snprintf( o.name, sizeof( o.name ), "%s", baseName );
++		else if( group.size() == 2 )
++		{
++			const char *word = xAxis ? ( group[i]->pos.x > c.x ? "est" : "ouest" ) : ( group[i]->pos.y > c.y ? "nord" : "sud" );
++			snprintf( o.name, sizeof( o.name ), "%s %s", baseName, word );
++		}
++		else
++		{
++			const float yaw = atan2f( group[i]->pos.y - c.y, group[i]->pos.x - c.x ) * 57.29578f;
++			snprintf( o.name, sizeof( o.name ), "%s %s %d", baseName, AccessMap_CompassWord( yaw ), (int)i + 1 );
++		}
++		s_Objectives.push_back( o );
++	}
++}
++
++static void AddCentroid( const std::vector<RawObjective> &raw, AccessObjectiveType type, const char *name )
++{
++	AccessObjective o;
++	o.type = type;
++	o.pos = MakeVec( 0, 0, 0 );
++	int n = 0;
++	for( const RawObjective &r : raw )
++	{
++		if( r.type != type )
++			continue;
++		o.pos.x += r.pos.x; o.pos.y += r.pos.y; o.pos.z += r.pos.z;
++		n++;
++	}
++	if( !n )
++		return;
++	o.pos.x /= n; o.pos.y /= n; o.pos.z /= n;
++
++	// The centroid can fall inside a wall; use the real spawn point closest to it.
++	const RawObjective *closest = NULL;
++	for( const RawObjective &r : raw )
++		if( r.type == type && ( !closest || Dist( r.pos, o.pos ) < Dist( closest->pos, o.pos ) ) )
++			closest = &r;
++	o.pos = closest->pos;
++	snprintf( o.name, sizeof( o.name ), "%s", name );
++	s_Objectives.push_back( o );
++}
++
++static void BuildObjectives( const std::vector<RawObjective> &raw )
++{
++	NameGroup( raw, OBJ_BOMBSITE, "site de bombe" );
++	NameGroup( raw, OBJ_RESCUE_ZONE, "zone de sauvetage" );
++	NameGroup( raw, OBJ_VIP_SAFETY, "zone de sécurité VIP" );
++	NameGroup( raw, OBJ_ESCAPE_ZONE, "zone d'évasion" );
++
++	int hostage = 0;
++	for( const RawObjective &r : raw )
++	{
++		if( r.type != OBJ_HOSTAGE )
++			continue;
++		AccessObjective o;
++		o.type = OBJ_HOSTAGE;
++		o.pos = r.pos;
++		snprintf( o.name, sizeof( o.name ), "otage %d", ++hostage );
++		s_Objectives.push_back( o );
++	}
++
++	AddCentroid( raw, OBJ_SPAWN_CT, "départ antiterroriste" );
++	AddCentroid( raw, OBJ_SPAWN_T, "départ terroriste" );
++}
++
++// ---------------------------------------------------------------------------
++// Nav mesh
++// ---------------------------------------------------------------------------
++
++static bool ParseNav( const unsigned char *data, size_t size )
++{
++	Reader r = { data, size, 0, true };
++	if( r.U32() != 0xFEEDFACE )
++		return false;
++	const unsigned int version = r.U32();
++	if( !r.ok || version == 0 || version > 5 )
++		return false;
++	if( version >= 4 )
++		r.Skip( 4 );	// bsp size
++
++	if( version >= 5 )
++	{
++		const unsigned short placeCount = r.U16();
++		for( int i = 0; i < placeCount && r.ok; i++ )
++			r.Skip( r.U16() );
++	}
++
++	const unsigned int count = r.U32();
++	if( !r.ok || count == 0 || count > 100000 )
++		return false;
++
++	std::vector<NavArea> areas( count );
++	std::vector<std::vector<unsigned int>> connIds( count );
++
++	for( unsigned int a = 0; a < count && r.ok; a++ )
++	{
++		NavArea &area = areas[a];
++		area.id = r.U32();
++		area.flags = r.U8();
++		area.lo.x = r.F32(); area.lo.y = r.F32(); area.lo.z = r.F32();
++		area.hi.x = r.F32(); area.hi.y = r.F32(); area.hi.z = r.F32();
++		area.neZ = r.F32();
++		area.swZ = r.F32();
++		area.center = MakeVec( ( area.lo.x + area.hi.x ) * 0.5f, ( area.lo.y + area.hi.y ) * 0.5f, ( area.lo.z + area.hi.z ) * 0.5f );
++
++		for( int d = 0; d < 4 && r.ok; d++ )
++		{
++			const unsigned int n = r.U32();
++			if( n > 10000 )
++				return false;
++			for( unsigned int i = 0; i < n && r.ok; i++ )
++				connIds[a].push_back( r.U32() );
++		}
++
++		const unsigned char hidingSpots = r.U8();
++		r.Skip( hidingSpots * ( version == 1 ? 12u : 17u ) );
++
++		const unsigned char approaches = r.U8();
++		r.Skip( approaches * 14u );
++
++		const unsigned int encounters = r.U32();
++		if( encounters > 100000 )
++			return false;
++		for( unsigned int e = 0; e < encounters && r.ok; e++ )
++		{
++			if( version < 3 )
++			{
++				r.Skip( 32 );
++				r.Skip( r.U8() * 16u );
++			}
++			else
++			{
++				r.Skip( 10 );
++				r.Skip( r.U8() * 5u );
++			}
++		}
++
++		if( version >= 5 )
++			r.Skip( 2 );	// place entry
++	}
++
++	if( !r.ok )
++		return false;
++
++	std::unordered_map<unsigned int, int> index;
++	for( unsigned int a = 0; a < count; a++ )
++		index[areas[a].id] = (int)a;
++	for( unsigned int a = 0; a < count; a++ )
++	{
++		for( unsigned int id : connIds[a] )
++		{
++			auto it = index.find( id );
++			if( it != index.end() )
++				areas[a].neighbors.push_back( it->second );
++		}
++	}
++
++	s_Areas.swap( areas );
++	return true;
++}
++
++// Bilinear height of an area at (x, y); corners are NW=lo.z, NE=neZ, SW=swZ, SE=hi.z.
++static float AreaZ( const NavArea &a, float x, float y )
++{
++	const float w = a.hi.x - a.lo.x, h = a.hi.y - a.lo.y;
++	const float u = w > 0.0f ? Clampf( ( x - a.lo.x ) / w, 0.0f, 1.0f ) : 0.0f;
++	const float v = h > 0.0f ? Clampf( ( y - a.lo.y ) / h, 0.0f, 1.0f ) : 0.0f;
++	const float northZ = a.lo.z + u * ( a.neZ - a.lo.z );
++	const float southZ = a.swZ + u * ( a.hi.z - a.swZ );
++	return northZ + v * ( southZ - northZ );
++}
++
++int AccessMap_FindArea( const AccessVec &pos )
++{
++	int best = -1;
++	float bestScore = 1e30f;
++
++	for( size_t i = 0; i < s_Areas.size(); i++ )
++	{
++		const NavArea &a = s_Areas[i];
++		const float cx = Clampf( pos.x, a.lo.x, a.hi.x );
++		const float cy = Clampf( pos.y, a.lo.y, a.hi.y );
++		const float horiz = sqrtf( ( cx - pos.x ) * ( cx - pos.x ) + ( cy - pos.y ) * ( cy - pos.y ) );
++		if( horiz > 200.0f )
++			continue;
++
++		const float dz = pos.z - AreaZ( a, cx, cy );
++		if( dz < -40.0f || dz > 120.0f )
++			continue;	// area is well above us, or a floor far below
++
++		// Prefer containing areas, then the floor right below the point.
++		const float score = horiz * 4.0f + fabsf( dz );
++		if( score < bestScore )
++		{
++			bestScore = score;
++			best = (int)i;
++		}
++	}
++	if( best >= 0 )
++		return best;
++
++	// Nothing plausible under the point (brush-zone centers float mid-air):
++	// fall back to the area whose surface is closest in 3D.
++	for( size_t i = 0; i < s_Areas.size(); i++ )
++	{
++		const NavArea &a = s_Areas[i];
++		const float cx = Clampf( pos.x, a.lo.x, a.hi.x );
++		const float cy = Clampf( pos.y, a.lo.y, a.hi.y );
++		const AccessVec surface = MakeVec( cx, cy, AreaZ( a, cx, cy ) );
++		const float d = Dist( surface, pos );
++		if( d < bestScore )
++		{
++			bestScore = d;
++			best = (int)i;
++		}
++	}
++	return best;
++}
++
++// Point on the shared boundary of two adjacent areas (middle of their overlap).
++static AccessVec PortalPoint( const NavArea &a, const NavArea &b )
++{
++	const float x0 = a.lo.x > b.lo.x ? a.lo.x : b.lo.x, x1 = a.hi.x < b.hi.x ? a.hi.x : b.hi.x;
++	const float y0 = a.lo.y > b.lo.y ? a.lo.y : b.lo.y, y1 = a.hi.y < b.hi.y ? a.hi.y : b.hi.y;
++	const float mx = ( a.center.x + b.center.x ) * 0.5f, my = ( a.center.y + b.center.y ) * 0.5f;
++	AccessVec p;
++	p.x = x0 <= x1 ? Clampf( mx, x0, x1 ) : mx;
++	p.y = y0 <= y1 ? Clampf( my, y0, y1 ) : my;
++	p.z = ( AreaZ( a, p.x, p.y ) + AreaZ( b, p.x, p.y ) ) * 0.5f;
++	return p;
++}
++
++float AccessMap_FindPath( const AccessVec &from, const AccessVec &to, std::vector<AccessVec> &waypoints )
++{
++	waypoints.clear();
++	const int start = AccessMap_FindArea( from );
++	int goal = AccessMap_FindArea( to );
++	if( start < 0 || goal < 0 )
++		return -1.0f;
++
++	const size_t n = s_Areas.size();
++	std::vector<float> g( n, 1e30f );
++	std::vector<int> parent( n, -1 );
++	std::vector<bool> closed( n, false );
++	typedef std::pair<float, int> Entry;
++	std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
++
++	g[start] = 0.0f;
++	open.push( Entry( Dist( s_Areas[start].center, s_Areas[goal].center ), start ) );
++
++	while( !open.empty() )
++	{
++		const int cur = open.top().second;
++		open.pop();
++		if( closed[cur] )
++			continue;
++		if( cur == goal )
++			break;
++		closed[cur] = true;
++
++		for( int nb : s_Areas[cur].neighbors )
++		{
++			if( closed[nb] )
++				continue;
++			float cost = Dist( s_Areas[cur].center, s_Areas[nb].center );
++			if( s_Areas[nb].flags & NAV_JUMP )
++				cost *= 1.5f;
++			if( g[cur] + cost < g[nb] )
++			{
++				g[nb] = g[cur] + cost;
++				parent[nb] = cur;
++				open.push( Entry( g[nb] + Dist( s_Areas[nb].center, s_Areas[goal].center ), nb ) );
++			}
++		}
++	}
++
++	if( start != goal && parent[goal] < 0 )
++	{
++		// The goal lies in a part of the mesh we cannot reach (one-way drops,
++		// isolated rooftops). The search has exhausted every reachable area, so
++		// guide to the reachable one closest to the goal instead.
++		int bestArea = -1;
++		float bestDist = 1e30f;
++		for( size_t i = 0; i < n; i++ )
++		{
++			if( g[i] >= 1e30f )
++				continue;
++			const float d = Dist( s_Areas[i].center, to );
++			if( d < bestDist )
++			{
++				bestDist = d;
++				bestArea = (int)i;
++			}
++		}
++		if( bestArea < 0 )
++			return -1.0f;
++		goal = bestArea;
++	}
++
++	std::vector<int> chain;
++	for( int a = goal; a >= 0; a = parent[a] )
++	{
++		chain.push_back( a );
++		if( a == start )
++			break;
++	}
++
++	for( size_t i = chain.size() - 1; i > 0; i-- )
++		waypoints.push_back( PortalPoint( s_Areas[chain[i]], s_Areas[chain[i - 1]] ) );
++	waypoints.push_back( to );
++
++	float length = 0.0f;
++	AccessVec prev = from;
++	for( const AccessVec &w : waypoints )
++	{
++		length += Dist( prev, w );
++		prev = w;
++	}
++	return length;
++}
++
++// ---------------------------------------------------------------------------
++// Loading
++// ---------------------------------------------------------------------------
++
++bool AccessMap_HasNav( void )
++{
++	return !s_Areas.empty();
++}
++
++const std::vector<AccessObjective> &AccessMap_Objectives( void )
++{
++	return s_Objectives;
++}
++
++void AccessMap_LoadFromBuffers( const unsigned char *bsp, size_t bspSize, const unsigned char *nav, size_t navSize )
++{
++	s_Objectives.clear();
++	s_Areas.clear();
++
++	std::vector<RawObjective> raw;
++	if( bsp )
++		ParseBspObjectives( bsp, bspSize, raw );
++	BuildObjectives( raw );
++
++	if( nav && !ParseNav( nav, navSize ) )
++		s_Areas.clear();
++}
++
++#ifndef ACCESS_MAP_STANDALONE
++void AccessMap_Update( const char *levelName )
++{
++	if( !levelName || !levelName[0] )
++		return;
++	if( !strcmp( levelName, s_szLevel ) )
++		return;
++	snprintf( s_szLevel, sizeof( s_szLevel ), "%s", levelName );
++
++	// levelName is "maps/<map>.bsp"
++	char navName[256];
++	snprintf( navName, sizeof( navName ), "%s", levelName );
++	char *ext = strrchr( navName, '.' );
++	if( ext && ( ext - navName ) + 5 < (int)sizeof( navName ) )
++		strcpy( ext, ".nav" );
++
++	int bspLen = 0, navLen = 0;
++	byte *bsp = gEngfuncs.COM_LoadFile( (char *)levelName, 5, &bspLen );
++	byte *nav = gEngfuncs.COM_LoadFile( navName, 5, &navLen );
++
++	AccessMap_LoadFromBuffers( bsp, bsp ? bspLen : 0, nav, nav ? navLen : 0 );
++
++	if( bsp )
++		gEngfuncs.COM_FreeFile( bsp );
++	if( nav )
++		gEngfuncs.COM_FreeFile( nav );
++
++	gEngfuncs.Con_Printf( "[access] %s : %d objectifs, %d zones de navigation\n", levelName,
++		(int)s_Objectives.size(), (int)s_Areas.size() );
++}
++#endif
+diff --git a/cl_dll/accessibility/access_map.h b/cl_dll/accessibility/access_map.h
+new file mode 100644
+index 0000000..2d5319a
+--- /dev/null
++++ b/cl_dll/accessibility/access_map.h
+@@ -0,0 +1,47 @@
++/*
++access_map.h - map knowledge for navigation: objectives (from the BSP entity
++lump) and the bot navigation mesh (maps/<map>.nav) with A* path finding
++*/
++#pragma once
++
++#include <vector>
++
++struct AccessVec
++{
++	float x, y, z;
++};
++
++enum AccessObjectiveType
++{
++	OBJ_BOMBSITE = 0,
++	OBJ_HOSTAGE,
++	OBJ_RESCUE_ZONE,
++	OBJ_VIP_SAFETY,
++	OBJ_ESCAPE_ZONE,
++	OBJ_SPAWN_CT,
++	OBJ_SPAWN_T,
++};
++
++struct AccessObjective
++{
++	AccessObjectiveType type;
++	AccessVec pos;
++	char name[64];	// spoken, e.g. "site de bombe est"
++};
++
++// Reloads everything when the level changes; cheap to call every frame.
++void AccessMap_Update( const char *levelName );
++bool AccessMap_HasNav( void );
++const std::vector<AccessObjective> &AccessMap_Objectives( void );
++
++// "nord", "nord-est", ... for a world yaw in degrees (0 = +x = east, 90 = +y = north).
++const char *AccessMap_CompassWord( float yawDegrees );
++
++// Nav area under/near a point, or -1.
++int AccessMap_FindArea( const AccessVec &pos );
++// A* over the nav mesh. Fills waypoints (portal points between areas, then goal)
++// and returns the path length in world units, or -1 when unreachable.
++float AccessMap_FindPath( const AccessVec &from, const AccessVec &to, std::vector<AccessVec> &waypoints );
++
++// Parser entry point, also used by the standalone tests.
++void AccessMap_LoadFromBuffers( const unsigned char *bsp, size_t bspSize, const unsigned char *nav, size_t navSize );
+diff --git a/cl_dll/accessibility/access_nav.cpp b/cl_dll/accessibility/access_nav.cpp
+new file mode 100644
+index 0000000..281b8fb
+--- /dev/null
++++ b/cl_dll/accessibility/access_nav.cpp
+@@ -0,0 +1,1105 @@
++/*
++access_nav.cpp - audio navigation and combat cues for blind players
++
++Everything here turns world state into short procedural sounds (access_audio)
++placed around the listener: pan = left/right, muffled = behind, higher pitch =
++above / closer. Speech (access_speech) is reserved for discrete facts.
++
++Fair-play rule: enemies are only sonified when the local player has a clear
++line of sight to them, i.e. information a sighted player would have on screen.
++*/
++
++#include "hud.h"
++#include "cl_util.h"
++#include "const.h"
++#include "entity_state.h"
++#include "cl_entity.h"
++#include "com_model.h"
++#include "pm_defs.h"
++#include "pmtrace.h"
++#include "event_api.h"
++#include "com_weapons.h"
++
++#include "accessibility/access_audio.h"
++#include "accessibility/access_map.h"
++#include "accessibility/access_nav.h"
++#include "accessibility/access_speech.h"
++#include "accessibility/access_tts.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++#include <vector>
++
++extern int g_iUser1;
++
++static const float UNITS_TO_METERS = 0.0254f;
++static const float RAD2DEG = 57.2957795f;
++static const float DEG2RAD = 0.0174532925f;
++
++static cvar_t *access_cues;
++static cvar_t *access_cue_volume;
++static cvar_t *access_sonar;
++static cvar_t *access_sonar_range;
++static cvar_t *access_ledges;
++static cvar_t *access_enemies;
++static cvar_t *access_enemy_fov;
++static cvar_t *access_teammates;
++static cvar_t *access_aimcue;
++static cvar_t *access_aim_cone;
++static cvar_t *access_grenades;
++static cvar_t *access_compass_tick;
++static cvar_t *access_heartbeat;
++
++// ---------------------------------------------------------------------------
++// Listener and spatialization
++// ---------------------------------------------------------------------------
++
++struct Listener
++{
++	Vector origin;		// hull center
++	Vector eye;
++	float feetZ;
++	float yaw, pitch;	// degrees, HL convention (yaw 0 = +x, 90 = +y; pitch > 0 looks down)
++	Vector forward;		// full view direction
++	int index;
++	int team;
++	bool ducking;
++};
++
++static Listener s_L;
++static float s_flTime;
++static float s_flPrevYaw;
++static Vector s_vecPrevOrigin;
++static float s_flSpeed;		// horizontal units/s
++static float s_flTurnRate;	// degrees/s
++static Vector s_vecMoveDir;	// normalized horizontal velocity
++
++static float NormalizeAngle( float a )
++{
++	a = fmodf( a + 180.0f, 360.0f );
++	if( a < 0.0f )
++		a += 360.0f;
++	return a - 180.0f;
++}
++
++// Angle of pos relative to the view, positive = to the left.
++static float RelativeYaw( const Vector &pos )
++{
++	return NormalizeAngle( atan2f( pos.y - s_L.eye.y, pos.x - s_L.eye.x ) * RAD2DEG - s_L.yaw );
++}
++
++static AccessCueParams SpatialFromRelYaw( float relYaw, float gain )
++{
++	AccessCueParams p;
++	p.pan = -sinf( relYaw * DEG2RAD );
++	p.muffle = fabsf( relYaw ) > 90.0f ? ( fabsf( relYaw ) - 90.0f ) / 90.0f : 0.0f;
++	p.gain = gain;
++	p.pitch = 1.0f;
++	return p;
++}
++
++// Full 3D placement: direction, distance falloff, and elevation mapped to pitch
++// (+/- half an octave for straight up/down).
++static AccessCueParams Spatial( const Vector &pos, float maxDistance, float baseGain )
++{
++	const Vector d = pos - s_L.eye;
++	const float horiz = sqrtf( d.x * d.x + d.y * d.y );
++	const float dist = d.Length();
++
++	float gain = baseGain;
++	if( maxDistance > 0.0f )
++	{
++		const float falloff = 1.0f - dist / maxDistance;
++		gain *= falloff < 0.2f ? 0.2f : falloff;
++	}
++
++	AccessCueParams p = SpatialFromRelYaw( RelativeYaw( pos ), gain );
++	const float elevation = atan2f( d.z, horiz > 1.0f ? horiz : 1.0f ) * RAD2DEG;
++	p.pitch = powf( 2.0f, elevation / 90.0f * 0.5f );
++	return p;
++}
++
++static void Play( AccessCue cue, const AccessCueParams &p )
++{
++	if( !access_cues || !access_cues->value )
++		return;
++	AccessAudio_Play( cue, p );
++
++	// Transcript (ACCESS_TTS_LOG only): first use of each cue, for automated checks.
++	static const char *names[CUE_COUNT] = { "mur côté", "mur devant", "vide", "marche", "balise", "arrivée",
++		"ennemi", "coéquipier", "visée", "visée verrouillée", "objectif", "nord", "balayage", "ouverture",
++		"dégâts", "grenade", "cœur", "munitions", "ennemi repéré" };
++	static bool logged[CUE_COUNT];
++	if( cue >= 0 && cue < CUE_COUNT && !logged[cue] )
++	{
++		char line[96];
++		snprintf( line, sizeof( line ), "son : %s (pan %.2f, étouffé %.2f)", names[cue], p.pan, p.muffle );
++		AccessTts_Log( line );
++		logged[cue] = true;
++	}
++}
++
++static AccessCueParams Centered( float gain )
++{
++	return SpatialFromRelYaw( 0.0f, gain );
++}
++
++// 1..12 o'clock for a relative yaw (12 = ahead, 3 = right, 9 = left).
++static int ClockHour( float relYaw )
++{
++	int h = (int)floorf( -relYaw / 30.0f + 0.5f );
++	h = ( ( h % 12 ) + 12 ) % 12;
++	return h == 0 ? 12 : h;
++}
++
++// "1 heure" / "3 heures"; rotating buffers so several fit in one printf.
++static const char *ClockText( float relYaw )
++{
++	static char buffers[4][16];
++	static int next;
++	char *out = buffers[next];
++	next = ( next + 1 ) % 4;
++	const int h = ClockHour( relYaw );
++	snprintf( out, sizeof( buffers[0] ), "%d heure%s", h, h > 1 ? "s" : "" );
++	return out;
++}
++
++static int Meters( float units )
++{
++	return (int)( units * UNITS_TO_METERS + 0.5f );
++}
++
++// ---------------------------------------------------------------------------
++// Traces (world and brush entities; players are never solid here)
++// ---------------------------------------------------------------------------
++
++static bool s_bTraceOpen;
++
++static void BeginTraces( void )
++{
++	gEngfuncs.pEventAPI->EV_SetUpPlayerPrediction( false, true );
++	gEngfuncs.pEventAPI->EV_PushPMStates();
++	gEngfuncs.pEventAPI->EV_SetTraceHull( 2 );
++	s_bTraceOpen = true;
++}
++
++static void EndTraces( void )
++{
++	if( s_bTraceOpen )
++		gEngfuncs.pEventAPI->EV_PopPMStates();
++	s_bTraceOpen = false;
++}
++
++// Distance travelled before hitting something (== full length when clear).
++static float TraceDistance( const Vector &start, const Vector &end, Vector *hit = NULL )
++{
++	pmtrace_t tr;
++	Vector s = start, e = end;
++	gEngfuncs.pEventAPI->EV_PlayerTrace( s, e, PM_STUDIO_IGNORE, -1, &tr );
++	if( hit )
++		*hit = tr.endpos;
++	if( tr.startsolid )
++		return 0.0f;
++	return ( end - start ).Length() * tr.fraction;
++}
++
++static bool LineOfSight( const Vector &start, const Vector &end )
++{
++	pmtrace_t tr;
++	Vector s = start, e = end;
++	gEngfuncs.pEventAPI->EV_PlayerTrace( s, e, PM_STUDIO_IGNORE | PM_GLASS_IGNORE, -1, &tr );
++	return !tr.startsolid && tr.fraction > 0.99f;
++}
++
++static Vector DirFromYaw( float yawDegrees )
++{
++	return Vector( cosf( yawDegrees * DEG2RAD ), sinf( yawDegrees * DEG2RAD ), 0.0f );
++}
++
++// ---------------------------------------------------------------------------
++// Wall sonar and ledge / step detection
++// ---------------------------------------------------------------------------
++
++static const float s_SonarAngles[] = { 0.0f, 45.0f, -45.0f, 90.0f, -90.0f, 180.0f };
++static int s_iSonarStep;
++static float s_flNextSonar;
++static float s_flNextLedge;
++static float s_flNextStep;
++static bool s_bWarnedBigDrop;
++
++static void UpdateSonar( void )
++{
++	const int mode = access_sonar ? (int)access_sonar->value : 0;
++	if( mode <= 0 || s_flTime < s_flNextSonar )
++		return;
++	s_flNextSonar = s_flTime + 0.045f;
++
++	// Mode 1: only while moving or turning, so standing still is quiet.
++	const bool active = mode >= 2 || s_flSpeed > 20.0f || s_flTurnRate > 25.0f;
++	const int count = sizeof( s_SonarAngles ) / sizeof( s_SonarAngles[0] );
++	const float rel = s_SonarAngles[s_iSonarStep];
++	s_iSonarStep = ( s_iSonarStep + 1 ) % count;
++	if( !active && rel != 0.0f )
++		return;
++
++	const float range = access_sonar_range && access_sonar_range->value > 16.0f ? access_sonar_range->value : 128.0f;
++	const Vector start = s_L.origin;
++	const Vector end = start + DirFromYaw( s_L.yaw + rel ) * range;
++	const float d = TraceDistance( start, end );
++	if( d >= range - 1.0f )
++		return;
++
++	const float closeness = 1.0f - d / range;
++	AccessCueParams p = SpatialFromRelYaw( rel, 0.15f + 0.6f * closeness * closeness );
++	p.pitch = 0.85f + 0.5f * closeness;
++	Play( rel == 0.0f ? CUE_WALL_FRONT : CUE_WALL_TAP, p );
++}
++
++static void UpdateLedges( void )
++{
++	if( !access_ledges || !access_ledges->value || s_flSpeed < 30.0f )
++		return;
++
++	const Vector dir = s_vecMoveDir;
++	const float probe = 56.0f;
++
++	// Obstacle at knee height but clear at jump height -> can be jumped.
++	const Vector knee( s_L.origin.x, s_L.origin.y, s_L.feetZ + 18.0f );
++	const float kneeDist = TraceDistance( knee, knee + dir * probe );
++	if( kneeDist < probe - 8.0f )
++	{
++		const Vector high( s_L.origin.x, s_L.origin.y, s_L.feetZ + 58.0f );
++		if( TraceDistance( high, high + dir * probe ) >= probe - 1.0f && s_flTime >= s_flNextStep )
++		{
++			Play( CUE_STEP, SpatialFromRelYaw( NormalizeAngle( atan2f( dir.y, dir.x ) * RAD2DEG - s_L.yaw ), 0.7f ) );
++			s_flNextStep = s_flTime + 0.8f;
++		}
++		return;
++	}
++
++	// Floor ahead: how far down is it?
++	const Vector ahead = knee + dir * probe;
++	Vector hit;
++	const float maxDrop = 400.0f;
++	const float down = TraceDistance( ahead, ahead - Vector( 0.0f, 0.0f, 18.0f + maxDrop ), &hit );
++	const float drop = down - 18.0f;
++	if( drop < 48.0f )
++	{
++		s_bWarnedBigDrop = false;
++		return;
++	}
++
++	if( s_flTime >= s_flNextLedge )
++	{
++		// Deeper drops sound lower.
++		AccessCueParams p = SpatialFromRelYaw( NormalizeAngle( atan2f( dir.y, dir.x ) * RAD2DEG - s_L.yaw ), 0.8f );
++		p.pitch = drop > 250.0f ? 0.6f : ( drop > 120.0f ? 0.8f : 1.0f );
++		Play( CUE_LEDGE, p );
++		s_flNextLedge = s_flTime + 0.7f;
++	}
++
++	// Falls over ~200 units hurt in CS.
++	if( drop > 220.0f && !s_bWarnedBigDrop )
++	{
++		s_bWarnedBigDrop = true;
++		Access_Speak( drop >= maxDrop ? "Vide profond devant" : "Chute dangereuse devant" );
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Radar sweep (access_scan): 24 rays around the player, near walls sound high,
++// far walls low, open space is a breath of noise. Ends with a spoken summary.
++// ---------------------------------------------------------------------------
++
++static const int SCAN_STEPS = 24;
++static const float SCAN_RANGE = 1200.0f;
++static const float SCAN_OPEN = 500.0f;
++static int s_iScanStep = -1;
++static float s_flNextScan;
++static float s_ScanDist[SCAN_STEPS];
++static float s_flScanYaw;
++
++static void Cmd_Scan( void )
++{
++	// Never ignore a request silently: say why nothing will be heard.
++	if( gHUD.m_fPlayerDead || g_iUser1 || CL_IsDead() )
++	{
++		Access_Speak( "Balayage impossible, vous n'êtes pas en jeu", true );
++		return;
++	}
++	if( gHUD.m_Menu.m_fMenuDisplayed )
++	{
++		Access_Speak( "Fermez le menu pour lancer le balayage", true );
++		return;
++	}
++	s_iScanStep = 0;
++	s_flNextScan = 0.0f;
++	s_flScanYaw = s_L.yaw;
++}
++
++static void UpdateScan( void )
++{
++	if( s_iScanStep < 0 || s_flTime < s_flNextScan )
++		return;
++	s_flNextScan = s_flTime + 0.06f;
++
++	// Clockwise from straight ahead: rel 0, -15 (right), ... all the way round.
++	const float rel = -360.0f * s_iScanStep / SCAN_STEPS;
++	const Vector start = s_L.eye;
++	const float d = TraceDistance( start, start + DirFromYaw( s_flScanYaw + rel ) * SCAN_RANGE );
++	s_ScanDist[s_iScanStep] = d;
++
++	const float relNow = NormalizeAngle( s_flScanYaw + rel - s_L.yaw );
++	if( d >= SCAN_OPEN )
++	{
++		Play( CUE_OPENING, SpatialFromRelYaw( relNow, 0.55f ) );
++	}
++	else
++	{
++		AccessCueParams p = SpatialFromRelYaw( relNow, 0.35f + 0.5f * ( 1.0f - d / SCAN_OPEN ) );
++		p.pitch = 2.0f - 1.4f * ( d / SCAN_OPEN );
++		Play( CUE_SCAN, p );
++	}
++
++	if( ++s_iScanStep < SCAN_STEPS )
++		return;
++	s_iScanStep = -1;
++
++	// Summarize contiguous open sectors as clock directions.
++	char buf[256] = "";
++	int openings = 0;
++	for( int i = 0; i < SCAN_STEPS; i++ )
++	{
++		const int prev = ( i + SCAN_STEPS - 1 ) % SCAN_STEPS;
++		if( s_ScanDist[i] < SCAN_OPEN || s_ScanDist[prev] >= SCAN_OPEN )
++			continue;
++		int j = i;
++		while( s_ScanDist[( j + 1 ) % SCAN_STEPS] >= SCAN_OPEN && ( j + 1 ) % SCAN_STEPS != i )
++			j++;
++		const float mid = -360.0f * ( i + j ) * 0.5f / SCAN_STEPS;
++		char part[48];
++		snprintf( part, sizeof( part ), "%s%s", openings ? ", " : "", ClockText( mid ) );
++		strncat( buf, part, sizeof( buf ) - strlen( buf ) - 1 );
++		openings++;
++	}
++
++	int nearest = 0;
++	for( int i = 1; i < SCAN_STEPS; i++ )
++		if( s_ScanDist[i] < s_ScanDist[nearest] )
++			nearest = i;
++
++	int openRays = 0;
++	for( int i = 0; i < SCAN_STEPS; i++ )
++		openRays += s_ScanDist[i] >= SCAN_OPEN;
++
++	char summary[384];
++	if( openRays == SCAN_STEPS )
++		snprintf( summary, sizeof( summary ), "Espace ouvert tout autour" );
++	else if( openings == 0 )
++		snprintf( summary, sizeof( summary ), "Espace fermé. Mur le plus proche à %s, %d mètres",
++			ClockText( -360.0f * nearest / SCAN_STEPS ), Meters( s_ScanDist[nearest] ) );
++	else
++		snprintf( summary, sizeof( summary ), "Ouvertures à %s. Mur le plus proche à %s, %d mètres",
++			buf, ClockText( -360.0f * nearest / SCAN_STEPS ), Meters( s_ScanDist[nearest] ) );
++	Access_Speak( summary );
++}
++
++// ---------------------------------------------------------------------------
++// Guidance to an objective along the nav mesh
++// ---------------------------------------------------------------------------
++
++struct Target
++{
++	char name[64];
++	Vector pos;
++	bool dynamic;	// bomb: position follows the radar
++};
++
++static std::vector<Target> s_Targets;
++static int s_iTarget = -1;
++static char s_szTargetName[64];
++static std::vector<AccessVec> s_Path;
++static size_t s_iPathNext;
++static float s_flNextRepath;
++static float s_flNextBeacon;
++
++static AccessVec ToAccess( const Vector &v )
++{
++	AccessVec a = { v.x, v.y, v.z };
++	return a;
++}
++
++static Vector FromAccess( const AccessVec &a )
++{
++	return Vector( a.x, a.y, a.z );
++}
++
++static bool BombVisibleOnRadar( void )
++{
++	const extra_player_info_t &bomb = g_PlayerExtraInfo[33];
++	return !bomb.dead && ( bomb.origin.x != 0.0f || bomb.origin.y != 0.0f );
++}
++
++static void RebuildTargets( void )
++{
++	s_Targets.clear();
++	if( BombVisibleOnRadar() )
++	{
++		Target t;
++		snprintf( t.name, sizeof( t.name ), "%s", g_PlayerExtraInfo[33].playerclass ? "bombe posée" : "bombe au sol" );
++		t.pos = g_PlayerExtraInfo[33].origin;
++		t.dynamic = true;
++		s_Targets.push_back( t );
++	}
++	for( const AccessObjective &o : AccessMap_Objectives() )
++	{
++		Target t;
++		snprintf( t.name, sizeof( t.name ), "%s", o.name );
++		t.pos = FromAccess( o.pos );
++		t.dynamic = false;
++		s_Targets.push_back( t );
++	}
++}
++
++static const Target *CurrentTarget( void )
++{
++	for( const Target &t : s_Targets )
++		if( !strcmp( t.name, s_szTargetName ) )
++			return &t;
++	return NULL;
++}
++
++static float Repath( const Target &t )
++{
++	const AccessVec feet = { s_L.origin.x, s_L.origin.y, s_L.feetZ + 1.0f };
++	const float length = AccessMap_FindPath( feet, ToAccess( t.pos ), s_Path );
++	s_iPathNext = 0;
++	s_flNextRepath = s_flTime + 1.5f;
++	if( length < 0.0f )
++	{
++		// No nav mesh: head straight for it.
++		s_Path.clear();
++		s_Path.push_back( ToAccess( t.pos ) );
++		return ( t.pos - s_L.origin ).Length();
++	}
++	return length;
++}
++
++static void SelectTarget( int delta )
++{
++	RebuildTargets();
++	if( s_Targets.empty() )
++	{
++		Access_Speak( "Aucune cible sur cette carte", true );
++		return;
++	}
++
++	s_iTarget = s_iTarget < 0 ? ( delta > 0 ? 0 : (int)s_Targets.size() - 1 )
++		: ( ( s_iTarget + delta ) % (int)s_Targets.size() + (int)s_Targets.size() ) % (int)s_Targets.size();
++	const Target &t = s_Targets[s_iTarget];
++	snprintf( s_szTargetName, sizeof( s_szTargetName ), "%s", t.name );
++
++	const float length = Repath( t );
++	char buf[160];
++	snprintf( buf, sizeof( buf ), "%s, %d mètres, à %s", t.name, Meters( length ), ClockText( RelativeYaw( t.pos ) ) );
++	Access_Speak( buf, true );
++	s_flNextBeacon = 0.0f;
++}
++
++static void Cmd_TargetNext( void ) { SelectTarget( 1 ); }
++static void Cmd_TargetPrev( void ) { SelectTarget( -1 ); }
++
++static void StopGuidance( void )
++{
++	s_iTarget = -1;
++	s_szTargetName[0] = 0;
++	s_Path.clear();
++}
++
++static void Cmd_TargetStop( void )
++{
++	StopGuidance();
++	Access_Speak( "Guidage arrêté", true );
++}
++
++static void UpdateGuidance( void )
++{
++	if( !s_szTargetName[0] )
++		return;
++
++	RebuildTargets();
++	const Target *t = CurrentTarget();
++	if( !t )
++	{
++		StopGuidance();	// e.g. the dropped bomb was picked up
++		return;
++	}
++
++	const Vector feet( s_L.origin.x, s_L.origin.y, s_L.feetZ );
++	const float toGoal = ( t->pos - feet ).Length2D();
++	if( toGoal < 90.0f && fabsf( t->pos.z - feet.z ) < 120.0f )
++	{
++		Play( CUE_ARRIVED, Centered( 0.9f ) );
++		char buf[96];
++		snprintf( buf, sizeof( buf ), "Arrivé : %s", t->name );
++		Access_Speak( buf );
++		StopGuidance();
++		return;
++	}
++
++	if( s_Path.empty() || s_flTime >= s_flNextRepath )
++		Repath( *t );
++
++	// Drop waypoints we have reached.
++	while( s_iPathNext + 1 < s_Path.size() && ( FromAccess( s_Path[s_iPathNext] ) - feet ).Length2D() < 56.0f )
++		s_iPathNext++;
++
++	// Far off the path (fell, got pushed): recompute now.
++	if( ( FromAccess( s_Path[s_iPathNext] ) - feet ).Length2D() > 450.0f )
++		Repath( *t );
++
++	// Beacon on the farthest of the next few waypoints still in line of sight,
++	// so the sound leads around corners instead of into walls.
++	size_t aim = s_iPathNext;
++	for( size_t i = s_iPathNext + 1; i < s_Path.size() && i <= s_iPathNext + 4; i++ )
++	{
++		const Vector wp = FromAccess( s_Path[i] ) + Vector( 0.0f, 0.0f, 36.0f );
++		if( !LineOfSight( s_L.eye, wp ) )
++			break;
++		aim = i;
++	}
++
++	if( s_flTime < s_flNextBeacon )
++		return;
++
++	const Vector beacon = FromAccess( s_Path[aim] ) + Vector( 0.0f, 0.0f, 36.0f );
++	const float dist = ( beacon - s_L.eye ).Length();
++	// The bomb gets its own timbre so it is never confused with a route point.
++	Play( t->dynamic ? CUE_OBJECTIVE : CUE_BEACON, Spatial( beacon, 0.0f, 0.75f ) );
++	s_flNextBeacon = s_flTime + ( dist < 200.0f ? 0.35f : ( dist > 800.0f ? 1.1f : 0.35f + 0.75f * ( dist - 200.0f ) / 600.0f ) );
++}
++
++// ---------------------------------------------------------------------------
++// Players: visible enemies, nearby teammates, aim assistance tone
++// ---------------------------------------------------------------------------
++
++struct PlayerTrack
++{
++	bool visible;
++	float nextCue;
++	float nextCheck;
++};
++
++static PlayerTrack s_Players[MAX_PLAYERS + 1];
++static float s_flNextAim;
++
++static cl_entity_t *PlayerEntityIfInView( int i, cl_entity_t *local )
++{
++	cl_entity_t *ent = gEngfuncs.GetEntityByIndex( i );
++	if( !ent || !ent->player || ent == local || !ent->model )
++		return NULL;
++	if( ent->curstate.messagenum < local->curstate.messagenum )
++		return NULL;	// not in our PVS this frame
++	if( g_PlayerExtraInfo[i].dead )
++		return NULL;
++	return ent;
++}
++
++static void UpdatePlayers( cl_entity_t *local )
++{
++	const bool wantEnemies = access_enemies && access_enemies->value;
++	const bool wantTeam = access_teammates && access_teammates->value;
++	const bool wantAim = access_aimcue && access_aimcue->value;
++	const float fov = access_enemy_fov && access_enemy_fov->value > 0.0f ? access_enemy_fov->value : 360.0f;
++
++	struct Visible { int index; float dist; Vector chest; };
++	Visible visible[MAX_PLAYERS];
++	int visibleCount = 0;
++
++	const int maxClients = gEngfuncs.GetMaxClients() < MAX_PLAYERS ? gEngfuncs.GetMaxClients() : MAX_PLAYERS;
++	for( int i = 1; i <= maxClients; i++ )
++	{
++		PlayerTrack &track = s_Players[i];
++		cl_entity_t *ent = PlayerEntityIfInView( i, local );
++		const int team = g_PlayerExtraInfo[i].teamnumber;
++		if( !ent || team == 0 || s_L.team == 0 )
++		{
++			track.visible = false;
++			continue;
++		}
++
++		const Vector chest = ent->origin + Vector( 0.0f, 0.0f, 8.0f );
++		const float dist = ( chest - s_L.eye ).Length();
++
++		if( team == s_L.team )
++		{
++			if( wantTeam && dist < 350.0f && s_flTime >= track.nextCue )
++			{
++				Play( CUE_TEAMMATE, Spatial( chest, 350.0f, 0.35f ) );
++				track.nextCue = s_flTime + 1.2f;
++			}
++			continue;
++		}
++
++		if( !wantEnemies && !wantAim )
++			continue;
++
++		// Line-of-sight checks are the expensive part: 10 Hz per player.
++		if( s_flTime >= track.nextCheck )
++		{
++			track.nextCheck = s_flTime + 0.1f;
++			const bool inFov = fov >= 360.0f || fabsf( RelativeYaw( chest ) ) <= fov * 0.5f;
++			const Vector head = ent->origin + Vector( 0.0f, 0.0f, 26.0f );
++			const bool nowVisible = inFov && ( LineOfSight( s_L.eye, chest ) || LineOfSight( s_L.eye, head ) );
++
++			if( nowVisible && !track.visible && wantEnemies )
++			{
++				Play( CUE_ENEMY_SPOTTED, Spatial( chest, 0.0f, 0.9f ) );
++				track.nextCue = s_flTime + 0.35f;
++			}
++			track.visible = nowVisible;
++		}
++
++		if( track.visible && visibleCount < MAX_PLAYERS )
++		{
++			visible[visibleCount].index = i;
++			visible[visibleCount].dist = dist;
++			visible[visibleCount].chest = chest;
++			visibleCount++;
++		}
++	}
++
++	// Pulse the three closest visible enemies; closer = faster.
++	for( int pass = 0; pass < 3 && wantEnemies; pass++ )
++	{
++		int best = -1;
++		for( int v = 0; v < visibleCount; v++ )
++			if( visible[v].index > 0 && ( best < 0 || visible[v].dist < visible[best].dist ) )
++				best = v;
++		if( best < 0 )
++			break;
++
++		PlayerTrack &track = s_Players[visible[best].index];
++		if( s_flTime >= track.nextCue )
++		{
++			Play( CUE_ENEMY, Spatial( visible[best].chest, 2500.0f, 0.8f ) );
++			const float d = visible[best].dist;
++			track.nextCue = s_flTime + ( d < 300.0f ? 0.3f : ( d > 1500.0f ? 1.0f : 0.3f + 0.7f * ( d - 300.0f ) / 1200.0f ) );
++		}
++		visible[best].index = -visible[best].index;	// mark used
++	}
++	for( int v = 0; v < visibleCount; v++ )
++		if( visible[v].index < 0 )
++			visible[v].index = -visible[v].index;
++
++	// Aim tone for the visible enemy closest to the crosshair.
++	if( !wantAim || visibleCount == 0 || s_flTime < s_flNextAim )
++		return;
++
++	const float cone = access_aim_cone && access_aim_cone->value > 1.0f ? access_aim_cone->value : 30.0f;
++	float bestErr = 1e9f;
++	int bestV = -1;
++	for( int v = 0; v < visibleCount; v++ )
++	{
++		Vector to = visible[v].chest - s_L.eye;
++		to = to.Normalize();
++		const float cosErr = DotProduct( to, s_L.forward );
++		const float err = acosf( cosErr > 1.0f ? 1.0f : ( cosErr < -1.0f ? -1.0f : cosErr ) ) * RAD2DEG;
++		if( err < bestErr )
++		{
++			bestErr = err;
++			bestV = v;
++		}
++	}
++	if( bestV < 0 || bestErr > cone )
++		return;
++
++	// Roughly the angular half-width of a player's torso at that range.
++	const float lockAngle = atan2f( 14.0f, visible[bestV].dist ) * RAD2DEG;
++	const float relYaw = RelativeYaw( visible[bestV].chest );
++	if( bestErr <= ( lockAngle > 1.0f ? lockAngle : 1.0f ) )
++	{
++		Play( CUE_AIM_LOCK, Centered( 0.8f ) );
++		s_flNextAim = s_flTime + 0.11f;
++	}
++	else
++	{
++		AccessCueParams p = SpatialFromRelYaw( relYaw, 0.55f );
++		p.muffle = 0.0f;
++		p.pitch = 0.8f + 1.4f * ( 1.0f - bestErr / cone );
++		Play( CUE_AIM, p );
++		s_flNextAim = s_flTime + 0.06f + bestErr * 0.01f;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Grenades in flight
++// ---------------------------------------------------------------------------
++
++struct GrenadeTrack
++{
++	int index;
++	float nextCue;
++	float lastSeen;
++	bool own;	// thrown by the local player: tracked quietly, not announced
++};
++
++static std::vector<GrenadeTrack> s_Grenades;
++static float s_flNextGrenadeScan;
++
++static const char *GrenadeKind( const cl_entity_t *ent )
++{
++	if( !ent->model || ent->curstate.movetype != MOVETYPE_BOUNCE )
++		return NULL;	// dropped weapons use the same models but do not bounce
++	const char *name = ent->model->name;
++	if( strstr( name, "w_hegrenade" ) )
++		return "Grenade explosive";
++	if( strstr( name, "w_flashbang" ) )
++		return "Flash, détournez-vous";
++	if( strstr( name, "w_smokegrenade" ) )
++		return "Fumigène";
++	return NULL;
++}
++
++static void UpdateGrenades( cl_entity_t *local )
++{
++	if( !access_grenades || !access_grenades->value )
++		return;
++
++	if( s_flTime >= s_flNextGrenadeScan )
++	{
++		s_flNextGrenadeScan = s_flTime + 0.1f;
++		for( int i = gEngfuncs.GetMaxClients() + 1; i < 2048; i++ )
++		{
++			cl_entity_t *ent = gEngfuncs.GetEntityByIndex( i );
++			if( !ent )
++				break;
++			if( ent->curstate.messagenum < local->curstate.messagenum )
++				continue;
++			const char *kind = GrenadeKind( ent );
++			if( !kind || ( ent->origin - s_L.eye ).Length() > 900.0f )
++				continue;
++
++			bool known = false;
++			for( GrenadeTrack &g : s_Grenades )
++			{
++				if( g.index == i )
++				{
++					g.lastSeen = s_flTime;
++					known = true;
++				}
++			}
++			if( !known )
++			{
++				const bool own = ent->curstate.owner == local->index;
++				GrenadeTrack g = { i, 0.0f, s_flTime, own };
++				s_Grenades.push_back( g );
++				if( !own )
++					Access_Speak( kind, true );
++			}
++		}
++	}
++
++	for( size_t k = 0; k < s_Grenades.size(); )
++	{
++		GrenadeTrack &g = s_Grenades[k];
++		cl_entity_t *ent = gEngfuncs.GetEntityByIndex( g.index );
++		if( !ent || s_flTime - g.lastSeen > 0.5f )
++		{
++			s_Grenades.erase( s_Grenades.begin() + k );
++			continue;
++		}
++		if( s_flTime >= g.nextCue )
++		{
++			const float d = ( ent->origin - s_L.eye ).Length();
++			Play( CUE_GRENADE, Spatial( ent->origin, 900.0f, g.own ? 0.4f : 1.0f ) );
++			g.nextCue = s_flTime + ( d < 250.0f ? 0.3f : 0.6f );
++		}
++		k++;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Body state: heartbeat, compass tick
++// ---------------------------------------------------------------------------
++
++static int s_iHealth = 100;
++static float s_flNextHeartbeat;
++
++void AccessNav_OnHealth( int health )
++{
++	s_iHealth = health;
++}
++
++static void UpdateBody( void )
++{
++	if( access_heartbeat && access_heartbeat->value && s_iHealth > 0 && s_iHealth <= 25 && s_flTime >= s_flNextHeartbeat )
++	{
++		Play( CUE_HEARTBEAT, Centered( 0.5f ) );
++		s_flNextHeartbeat = s_flTime + 0.6f + s_iHealth * 0.03f;
++	}
++
++	if( access_compass_tick && access_compass_tick->value )
++	{
++		// Tick whenever the view sweeps across north (yaw 90).
++		const float a = NormalizeAngle( s_flPrevYaw - 90.0f ), b = NormalizeAngle( s_L.yaw - 90.0f );
++		if( ( a < 0.0f ) != ( b < 0.0f ) && fabsf( a ) < 90.0f && fabsf( b ) < 90.0f )
++			Play( CUE_NORTH, Centered( 0.4f ) );
++	}
++}
++
++void AccessNav_OnDamage( const float *from, int damage )
++{
++	if( damage <= 0 )
++		return;
++	const Vector src( from[0], from[1], from[2] );
++	AccessCueParams p = ( src.x == 0.0f && src.y == 0.0f && src.z == 0.0f ) ? Centered( 0.8f ) : Spatial( src, 0.0f, 0.8f );
++	p.gain = damage >= 30 ? 1.0f : 0.6f;
++	Play( CUE_DAMAGE, p );
++}
++
++static int s_iMaxClipSeen;
++
++void AccessNav_OnClip( bool weaponChanged, int clip )
++{
++	static int prevClip = -1;
++	if( weaponChanged )
++	{
++		s_iMaxClipSeen = clip;
++		prevClip = clip;
++		return;
++	}
++	if( clip > s_iMaxClipSeen )
++		s_iMaxClipSeen = clip;
++
++	if( clip >= 0 && prevClip >= 0 && clip < prevClip && s_iMaxClipSeen > 1 )
++	{
++		const int low = s_iMaxClipSeen / 5 > 1 ? s_iMaxClipSeen / 5 : 1;
++		if( clip == 0 )
++			Access_Speak( "Chargeur vide", true );
++		else if( clip <= low )
++			Play( CUE_AMMO_LOW, Centered( 0.6f ) );
++	}
++	prevClip = clip;
++}
++
++// ---------------------------------------------------------------------------
++// Spoken queries
++// ---------------------------------------------------------------------------
++
++static void Cmd_Where( void )
++{
++	char buf[512];
++	int o = snprintf( buf, sizeof( buf ), "Face %s.", AccessMap_CompassWord( s_L.yaw ) );
++
++	const Target *t = s_szTargetName[0] ? CurrentTarget() : NULL;
++	if( t )
++	{
++		o += snprintf( buf + o, sizeof( buf ) - o, " Cible %s, %d mètres, à %s.", t->name,
++			Meters( ( t->pos - s_L.origin ).Length() ), ClockText( RelativeYaw( t->pos ) ) );
++	}
++
++	// Two closest objectives, straight-line.
++	RebuildTargets();
++	int first = -1, second = -1;
++	float d1 = 1e30f, d2 = 1e30f;
++	for( int i = 0; i < (int)s_Targets.size(); i++ )
++	{
++		const float d = ( s_Targets[i].pos - s_L.origin ).Length();
++		if( d < d1 ) { second = first; d2 = d1; first = i; d1 = d; }
++		else if( d < d2 ) { second = i; d2 = d; }
++	}
++	const int picks[2] = { first, second };
++	for( int k = 0; k < 2 && o < (int)sizeof( buf ); k++ )
++	{
++		if( picks[k] < 0 )
++			continue;
++		const Target &p = s_Targets[picks[k]];
++		o += snprintf( buf + o, sizeof( buf ) - o, " %s à %d mètres, %s.", p.name,
++			Meters( ( p.pos - s_L.origin ).Length() ), ClockText( RelativeYaw( p.pos ) ) );
++	}
++	if( !AccessMap_HasNav() && o < (int)sizeof( buf ) )
++		snprintf( buf + o, sizeof( buf ) - o, " Pas de carte de navigation." );
++	Access_Speak( buf, true );
++}
++
++static void Cmd_Compass( void )
++{
++	char buf[64];
++	snprintf( buf, sizeof( buf ), "Face %s, %d degrés", AccessMap_CompassWord( s_L.yaw ),
++		(int)( fmodf( 450.0f - s_L.yaw, 360.0f ) + 0.5f ) % 360 );
++	Access_Speak( buf, true );
++}
++
++static void Cmd_Enemies( void )
++{
++	if( gHUD.m_fPlayerDead || g_iUser1 || CL_IsDead() )
++	{
++		Access_Speak( "Vous êtes mort ou spectateur", true );
++		return;
++	}
++
++	char buf[256];
++	int count = 0, o = 0;
++	buf[0] = 0;
++	for( int i = 1; i <= MAX_PLAYERS; i++ )
++	{
++		if( !s_Players[i].visible )
++			continue;
++		cl_entity_t *ent = gEngfuncs.GetEntityByIndex( i );
++		if( !ent )
++			continue;
++		count++;
++		if( o < (int)sizeof( buf ) )
++			o += snprintf( buf + o, sizeof( buf ) - o, "%s%s %d mètres", count > 1 ? ", " : "",
++				ClockText( RelativeYaw( ent->origin ) ), Meters( ( ent->origin - s_L.eye ).Length() ) );
++	}
++	char out[320];
++	if( count == 0 )
++		snprintf( out, sizeof( out ), "Aucun ennemi en vue" );
++	else
++		snprintf( out, sizeof( out ), "%d ennemi%s en vue : %s", count, count > 1 ? "s" : "", buf );
++	Access_Speak( out, true );
++}
++
++// ---------------------------------------------------------------------------
++// Frame
++// ---------------------------------------------------------------------------
++
++static bool UpdateListener( cl_entity_t *local )
++{
++	float angles[3];
++	gEngfuncs.GetViewAngles( angles );
++
++	float viewOfs[3] = { 0, 0, 0 };
++	gEngfuncs.pEventAPI->EV_LocalPlayerViewheight( viewOfs );
++
++	s_L.origin = local->origin;
++	s_L.eye = s_L.origin + Vector( viewOfs[0], viewOfs[1], viewOfs[2] );
++	s_L.ducking = viewOfs[2] < 15.0f;
++	s_L.feetZ = s_L.origin.z - ( s_L.ducking ? 18.0f : 36.0f );
++	s_L.pitch = angles[0];
++	s_L.yaw = angles[1];
++	s_L.forward = Vector( cosf( angles[1] * DEG2RAD ) * cosf( angles[0] * DEG2RAD ),
++		sinf( angles[1] * DEG2RAD ) * cosf( angles[0] * DEG2RAD ), -sinf( angles[0] * DEG2RAD ) );
++	s_L.index = local->index;
++	s_L.team = g_PlayerExtraInfo[local->index].teamnumber;
++	return true;
++}
++
++// The client clock restarts at every map change; timers scheduled on the old
++// clock would otherwise stay silent for as long as the previous map ran.
++static void ResetTimers( void )
++{
++	s_flNextSonar = s_flNextLedge = s_flNextStep = 0.0f;
++	s_flNextScan = s_flNextRepath = s_flNextBeacon = 0.0f;
++	s_flNextAim = s_flNextGrenadeScan = s_flNextHeartbeat = 0.0f;
++	memset( s_Players, 0, sizeof( s_Players ) );
++	s_Grenades.clear();
++	s_iScanStep = -1;
++	StopGuidance();
++}
++
++void AccessNav_Frame( void )
++{
++	const char *level = gEngfuncs.pfnGetLevelName();
++	if( !level || !level[0] )
++		return;	// not in a game
++	AccessMap_Update( level );
++	if( access_cue_volume )
++		AccessAudio_SetMasterVolume( access_cue_volume->value );
++
++	cl_entity_t *local = gEngfuncs.GetLocalPlayer();
++	const float now = gEngfuncs.GetClientTime();
++	if( !local || gHUD.m_iIntermission )
++		return;
++
++	const float dt = now - s_flTime;
++	if( dt < 0.0f )
++		ResetTimers();
++	s_flTime = now;
++	UpdateListener( local );
++
++	// Motion estimate for sonar gating and ledge probing direction.
++	if( dt > 0.0f && dt < 0.5f )
++	{
++		Vector delta = s_L.origin - s_vecPrevOrigin;
++		delta.z = 0.0f;
++		const float speed = delta.Length() / dt;
++		s_flSpeed = s_flSpeed * 0.7f + speed * 0.3f;
++		if( speed > 5.0f )
++			s_vecMoveDir = delta.Normalize();
++		s_flTurnRate = s_flTurnRate * 0.7f + fabsf( NormalizeAngle( s_L.yaw - s_flPrevYaw ) ) / dt * 0.3f;
++	}
++	if( s_flSpeed < 30.0f || s_vecMoveDir.Length() < 0.5f )
++		s_vecMoveDir = DirFromYaw( s_L.yaw );
++
++	// No world cues while not playing yet or while a numbered menu (team, appearance,
++	// buy, radio) is open: the menu is being read aloud.
++	const bool dead = gHUD.m_fPlayerDead || g_iUser1 || CL_IsDead() || s_L.team == 0;
++	const bool alive = !dead && !gHUD.m_Menu.m_fMenuDisplayed;
++	if( dead )
++	{
++		// Dead or spectating: forget the route and what was in sight, so queries
++		// like access_enemies_list do not report the view from before death.
++		if( s_szTargetName[0] )
++			StopGuidance();
++		for( int i = 0; i <= MAX_PLAYERS; i++ )
++			s_Players[i].visible = false;
++	}
++	if( !alive )
++	{
++		// A menu only pauses the cues; guidance resumes when it closes.
++		s_iScanStep = -1;
++	}
++	else
++	{
++		BeginTraces();
++		UpdateSonar();
++		UpdateLedges();
++		UpdateScan();
++		UpdateGuidance();
++		UpdatePlayers( local );
++		EndTraces();
++
++		UpdateGrenades( local );
++		UpdateBody();
++	}
++
++	s_vecPrevOrigin = s_L.origin;
++	s_flPrevYaw = s_L.yaw;
++}
++
++void AccessNav_Init( void )
++{
++	access_cues         = CVAR_CREATE( "access_cues", "1", FCVAR_ARCHIVE );
++	access_cue_volume   = CVAR_CREATE( "access_cue_volume", "0.8", FCVAR_ARCHIVE );
++	access_sonar        = CVAR_CREATE( "access_sonar", "1", FCVAR_ARCHIVE );
++	access_sonar_range  = CVAR_CREATE( "access_sonar_range", "128", FCVAR_ARCHIVE );
++	access_ledges       = CVAR_CREATE( "access_ledges", "1", FCVAR_ARCHIVE );
++	access_enemies      = CVAR_CREATE( "access_enemies", "1", FCVAR_ARCHIVE );
++	access_enemy_fov    = CVAR_CREATE( "access_enemy_fov", "360", FCVAR_ARCHIVE );
++	access_teammates    = CVAR_CREATE( "access_teammates", "1", FCVAR_ARCHIVE );
++	access_aimcue       = CVAR_CREATE( "access_aimcue", "1", FCVAR_ARCHIVE );
++	access_aim_cone     = CVAR_CREATE( "access_aim_cone", "30", FCVAR_ARCHIVE );
++	access_grenades     = CVAR_CREATE( "access_grenades", "1", FCVAR_ARCHIVE );
++	access_compass_tick = CVAR_CREATE( "access_compass_tick", "1", FCVAR_ARCHIVE );
++	access_heartbeat    = CVAR_CREATE( "access_heartbeat", "1", FCVAR_ARCHIVE );
++
++	gEngfuncs.pfnAddCommand( "access_scan", Cmd_Scan );
++	gEngfuncs.pfnAddCommand( "access_target_next", Cmd_TargetNext );
++	gEngfuncs.pfnAddCommand( "access_target_prev", Cmd_TargetPrev );
++	gEngfuncs.pfnAddCommand( "access_target_stop", Cmd_TargetStop );
++	gEngfuncs.pfnAddCommand( "access_where", Cmd_Where );
++	gEngfuncs.pfnAddCommand( "access_compass", Cmd_Compass );
++	gEngfuncs.pfnAddCommand( "access_enemies_list", Cmd_Enemies );
++
++	if( !AccessAudio_Init() )
++		gEngfuncs.Con_Printf( "[access] XAudio2 indisponible : repères sonores désactivés.\n" );
++}
++
++void AccessNav_Shutdown( void )
++{
++	AccessAudio_Shutdown();
++}
+diff --git a/cl_dll/accessibility/access_nav.h b/cl_dll/accessibility/access_nav.h
+new file mode 100644
+index 0000000..b9567d3
+--- /dev/null
++++ b/cl_dll/accessibility/access_nav.h
+@@ -0,0 +1,15 @@
++/*
++access_nav.h - audio navigation and combat cues for blind players
++(wall sonar, ledges, radar sweep, path guidance, enemies, aim, grenades, damage)
++*/
++#pragma once
++
++void AccessNav_Init( void );
++void AccessNav_Shutdown( void );
++// Call once per rendered frame, after the view has been set up.
++void AccessNav_Frame( void );
++
++// Event hooks.
++void AccessNav_OnDamage( const float *from, int damage );
++void AccessNav_OnClip( bool weaponChanged, int clip );
++void AccessNav_OnHealth( int health );
+diff --git a/cl_dll/accessibility/access_screens.cpp b/cl_dll/accessibility/access_screens.cpp
+new file mode 100644
+index 0000000..8d70c2d
+--- /dev/null
++++ b/cl_dll/accessibility/access_screens.cpp
+@@ -0,0 +1,251 @@
++/*
++access_screens.cpp - spoken versions of visual-only HUD screens
++*/
++
++#include "hud.h"
++#include "cl_util.h"
++
++#include "accessibility/access_screens.h"
++#include "accessibility/access_speech.h"
++
++#include <stdio.h>
++#include <string.h>
++
++extern int g_iUser1;
++extern int g_iUser2;
++
++static cvar_t *access_speech_hints;
++static cvar_t *access_speech_aimtarget;
++static cvar_t *access_speech_timer;
++
++static char s_szMotd[2048];
++static char s_szLastStatus[256];
++static char s_szLastHint[512];
++static float s_flLastHintTime;
++static int s_iLastSpecMode = -1;
++static int s_iLastSpecTarget = -1;
++static int s_iLastIntermission;
++static int s_iLastTimerAnnounce = -1;
++
++// Removes HTML tags/entities so HTML MOTDs (not drawn by the text HUD) can still be read.
++static void StripHtml( const char *in, char *out, size_t outSize )
++{
++	size_t o = 0;
++	bool inTag = false, inScript = false;
++	for( const char *p = in; *p && o + 2 < outSize; p++ )
++	{
++		if( *p == '<' )
++		{
++			inTag = true;
++			if( !strnicmp( p, "<script", 7 ) || !strnicmp( p, "<style", 6 ) )
++				inScript = true;
++			else if( !strnicmp( p, "</script", 8 ) || !strnicmp( p, "</style", 7 ) )
++				inScript = false;
++			// Block-level tags become line breaks.
++			if( !strnicmp( p, "<br", 3 ) || !strnicmp( p, "<p", 2 ) || !strnicmp( p, "</p", 3 ) ||
++				!strnicmp( p, "<li", 3 ) || !strnicmp( p, "<h", 2 ) || !strnicmp( p, "<div", 4 ) )
++				out[o++] = '\n';
++			continue;
++		}
++		if( *p == '>' && inTag )
++		{
++			inTag = false;
++			continue;
++		}
++		if( inTag || inScript )
++			continue;
++		if( *p == '&' )
++		{
++			static const struct { const char *ent; char ch; } ents[] =
++				{ { "&nbsp;", ' ' }, { "&amp;", '&' }, { "&lt;", '<' }, { "&gt;", '>' }, { "&quot;", '"' }, { "&#39;", '\'' } };
++			bool matched = false;
++			for( size_t e = 0; e < sizeof( ents ) / sizeof( ents[0] ); e++ )
++			{
++				const size_t len = strlen( ents[e].ent );
++				if( !strnicmp( p, ents[e].ent, len ) )
++				{
++					out[o++] = ents[e].ch;
++					p += len - 1;
++					matched = true;
++					break;
++				}
++			}
++			if( matched )
++				continue;
++		}
++		out[o++] = *p;
++	}
++	out[o] = 0;
++}
++
++void AccessScreens_OnMotd( const char *text )
++{
++	StripHtml( text, s_szMotd, sizeof( s_szMotd ) );
++	char buf[sizeof( s_szMotd ) + 32];
++	snprintf( buf, sizeof( buf ), "Message du serveur : %s", s_szMotd );
++	Access_Speak( buf );
++}
++
++void AccessScreens_OnHudText( const char *text )
++{
++	if( !access_speech_hints || !access_speech_hints->value || !text || !text[0] )
++		return;
++	// Servers often resend the same hint every frame or so.
++	if( !strcmp( text, s_szLastHint ) && gHUD.m_flTime - s_flLastHintTime < 5.0f )
++		return;
++	snprintf( s_szLastHint, sizeof( s_szLastHint ), "%s", text );
++	s_flLastHintTime = gHUD.m_flTime;
++	Access_Speak( text );
++}
++
++// "Enemy: Name  Health: 100%" etc. Spoken only when it changes.
++void AccessScreens_OnStatusBar( const char *text )
++{
++	if( !access_speech_aimtarget || !access_speech_aimtarget->value )
++		return;
++	if( !strcmp( text, s_szLastStatus ) )
++		return;
++	snprintf( s_szLastStatus, sizeof( s_szLastStatus ), "%s", text );
++	if( text[0] )
++		Access_Speak( text );
++}
++
++static const char *TeamName( int team )
++{
++	return team == 1 ? "terroristes" : ( team == 2 ? "antiterroristes" : "spectateurs" );
++}
++
++static void Cmd_Scores( void )
++{
++	char buf[2048];
++	int o = 0;
++
++	// Team scores (rounds won).
++	for( int t = 1; t <= 2; t++ )
++	{
++		for( int j = 0; j <= MAX_TEAMS; j++ )
++		{
++			if( g_TeamInfo[j].teamnumber != t || !g_TeamInfo[j].name[0] )
++				continue;
++			o += snprintf( buf + o, sizeof( buf ) - o, "%s %d. ", t == 1 ? "Terroristes" : "Antiterroristes", g_TeamInfo[j].frags );
++			break;
++		}
++	}
++
++	for( int team = 1; team <= 3 && o < (int)sizeof( buf ); team++ )
++	{
++		bool header = false;
++		for( int i = 1; i <= MAX_PLAYERS && i <= gEngfuncs.GetMaxClients() && o < (int)sizeof( buf ); i++ )
++		{
++			GetPlayerInfo( i, &g_PlayerInfoList[i] );
++			if( !g_PlayerInfoList[i].name || !g_PlayerInfoList[i].name[0] )
++				continue;
++			const int t = g_PlayerExtraInfo[i].teamnumber;
++			if( ( team == 3 ) ? ( t == 1 || t == 2 ) : t != team )
++				continue;
++			if( !header )
++			{
++				o += snprintf( buf + o, sizeof( buf ) - o, "Équipe %s : ", TeamName( team ) );
++				header = true;
++			}
++			o += snprintf( buf + o, sizeof( buf ) - o, "%s, %d frags %d morts%s%s. ",
++				g_PlayerInfoList[i].name, g_PlayerExtraInfo[i].frags, g_PlayerExtraInfo[i].deaths,
++				g_PlayerExtraInfo[i].dead ? ", mort" : "", g_PlayerExtraInfo[i].has_c4 ? ", porte la bombe" : "" );
++		}
++	}
++	Access_Speak( o ? buf : "Tableau des scores vide", true );
++}
++
++static void Cmd_Time( void )
++{
++	char buf[96];
++	if( !( gHUD.m_Timer.m_iFlags & HUD_DRAW ) )
++		snprintf( buf, sizeof( buf ), gHUD.m_SpectatorGui.m_bBombPlanted ? "Bombe posée, minuterie masquée" : "Pas de minuterie" );
++	else
++	{
++		const int t = gHUD.m_Timer.GetRemainingTime( gHUD.m_flTime );
++		snprintf( buf, sizeof( buf ), "%d minute%s %d secondes", t / 60, t / 60 > 1 ? "s" : "", t % 60 );
++	}
++	Access_Speak( buf, true );
++}
++
++static void Cmd_Motd( void )
++{
++	Access_Speak( s_szMotd[0] ? s_szMotd : "Pas de message du serveur", true );
++}
++
++static const char *SpectatorModeName( int mode )
++{
++	switch( mode )
++	{
++	case 1: return "caméra verrouillée";
++	case 2: return "caméra libre derrière le joueur";
++	case 3: return "vol libre";
++	case 4: return "à la première personne";
++	case 5: return "carte libre";
++	case 6: return "carte, suivi du joueur";
++	default: return "";
++	}
++}
++
++void AccessScreens_Frame( void )
++{
++	// Spectator: announce mode and the player being watched.
++	if( g_iUser1 != s_iLastSpecMode || ( g_iUser1 && g_iUser2 != s_iLastSpecTarget ) )
++	{
++		char buf[160] = "";
++		if( g_iUser1 && g_iUser1 != s_iLastSpecMode )
++			snprintf( buf, sizeof( buf ), "Spectateur, %s. ", SpectatorModeName( g_iUser1 ) );
++		if( g_iUser1 && g_iUser2 > 0 && g_iUser2 <= MAX_PLAYERS && g_iUser2 != s_iLastSpecTarget )
++		{
++			GetPlayerInfo( g_iUser2, &g_PlayerInfoList[g_iUser2] );
++			if( g_PlayerInfoList[g_iUser2].name )
++			{
++				const size_t len = strlen( buf );
++				snprintf( buf + len, sizeof( buf ) - len, "Vous regardez %s", g_PlayerInfoList[g_iUser2].name );
++			}
++		}
++		if( buf[0] )
++			Access_Speak( buf, true );
++		s_iLastSpecMode = g_iUser1;
++		s_iLastSpecTarget = g_iUser2;
++	}
++
++	// End of map: read the final scoreboard.
++	if( gHUD.m_iIntermission && !s_iLastIntermission )
++	{
++		Access_Speak( "Fin de la partie.", true );
++		Cmd_Scores();
++	}
++	s_iLastIntermission = gHUD.m_iIntermission;
++
++	// Round time warnings.
++	if( access_speech_timer && access_speech_timer->value && ( gHUD.m_Timer.m_iFlags & HUD_DRAW ) )
++	{
++		const int t = gHUD.m_Timer.GetRemainingTime( gHUD.m_flTime );
++		static const int marks[] = { 60, 30, 10 };
++		for( int m : marks )
++		{
++			if( t == m && s_iLastTimerAnnounce != m )
++			{
++				char buf[48];
++				snprintf( buf, sizeof( buf ), m == 60 ? "1 minute" : "%d secondes", m );
++				Access_Speak( buf );
++				s_iLastTimerAnnounce = m;
++			}
++		}
++		if( t > 60 )
++			s_iLastTimerAnnounce = -1;
++	}
++}
++
++void AccessScreens_Init( void )
++{
++	access_speech_hints     = CVAR_CREATE( "access_speech_hints", "1", FCVAR_ARCHIVE );
++	access_speech_aimtarget = CVAR_CREATE( "access_speech_aimtarget", "1", FCVAR_ARCHIVE );
++	access_speech_timer     = CVAR_CREATE( "access_speech_timer", "1", FCVAR_ARCHIVE );
++
++	gEngfuncs.pfnAddCommand( "access_scores", Cmd_Scores );
++	gEngfuncs.pfnAddCommand( "access_time", Cmd_Time );
++	gEngfuncs.pfnAddCommand( "access_motd", Cmd_Motd );
++}
+diff --git a/cl_dll/accessibility/access_screens.h b/cl_dll/accessibility/access_screens.h
+new file mode 100644
+index 0000000..7b95630
+--- /dev/null
++++ b/cl_dll/accessibility/access_screens.h
+@@ -0,0 +1,12 @@
++/*
++access_screens.h - spoken versions of the HUD screens that only exist visually:
++scoreboard, round timer, MOTD, hint texts, aim status bar, spectator, intermission
++*/
++#pragma once
++
++void AccessScreens_Init( void );
++void AccessScreens_Frame( void );
++
++void AccessScreens_OnHudText( const char *text );
++void AccessScreens_OnStatusBar( const char *text );
++void AccessScreens_OnMotd( const char *text );
+diff --git a/cl_dll/accessibility/access_speech.cpp b/cl_dll/accessibility/access_speech.cpp
+new file mode 100644
+index 0000000..7098d1f
+--- /dev/null
++++ b/cl_dll/accessibility/access_speech.cpp
+@@ -0,0 +1,465 @@
++/*
++access_speech.cpp - screen reader (NVDA) announcements for blind players
++
++Speech goes through access_tts (NVDA controller, loaded at runtime), so the
++client still works when NVDA is missing: announcements are then dropped.
++*/
++
++#include "hud.h"
++#include "cl_util.h"
++#include "accessibility/access_speech.h"
++#include "accessibility/access_nav.h"
++#include "accessibility/access_screens.h"
++
++#include <string.h>
++#include <stdio.h>
++
++#include "accessibility/access_tts.h"
++#include "vgui_parser.h"
++
++#define ACCESS_ARRAYSIZE( a ) ( sizeof( a ) / sizeof( ( a )[0] ) )
++
++static bool s_bWarned;
++
++static cvar_t *access_speech;
++static cvar_t *access_speech_chat;
++static cvar_t *access_speech_kills;
++static cvar_t *access_speech_hud;
++static cvar_t *access_textmenus;
++static cvar_t *access_debug;
++
++static char s_szLastSpoken[1024];
++
++// Cached HUD state for access_status.
++static int s_iHealth = -1;
++static int s_iArmor = -1;
++static int s_iMoney = -1;
++static char s_szWeapon[64];
++static int s_iClip = -1;
++static int s_iReserve = -1;
++
++// Latest-wins announcement slots: rapid updates (damage ticks, buy bursts) are
++// merged and only the final value is spoken once the value has settled.
++enum AccessSlot
++{
++	ACCESS_SLOT_HEALTH = 0,
++	ACCESS_SLOT_ARMOR,
++	ACCESS_SLOT_MONEY,
++	ACCESS_SLOT_COUNT
++};
++
++struct PendingAnnouncement
++{
++	char text[128];
++	unsigned int dueTick;
++	bool pending;
++};
++
++static PendingAnnouncement s_Pending[ACCESS_SLOT_COUNT];
++
++static const unsigned int ACCESS_COALESCE_MS = 400;
++
++// Strips GoldSrc markup so the screen reader only gets words:
++// color bytes (0x01-0x04), menu codes (\r \w \y \d \R), and runs of whitespace.
++// Newlines become ". " so menu items are separated by a pause.
++static void CleanForSpeech( const char *in, char *out, size_t outSize )
++{
++	size_t o = 0;
++	bool lastWasSpace = true;
++
++	for( const unsigned char *p = (const unsigned char *)in; *p && o + 3 < outSize; p++ )
++	{
++		unsigned char c = *p;
++
++		if( c == '\\' && p[1] && strchr( "rwydR", p[1] ) )
++		{
++			// \R right-aligns the rest of the line (prices in buy menus):
++			// read it as a separate column, "Sidearm, 400".
++			if( p[1] == 'R' && o > 0 && !lastWasSpace )
++			{
++				out[o++] = ',';
++				out[o++] = ' ';
++				lastWasSpace = true;
++			}
++			p++;
++			continue;
++		}
++
++		if( c == '\n' )
++		{
++			while( o > 0 && out[o - 1] == ' ' )
++				o--;
++			if( o > 0 && !strchr( ".:!?", out[o - 1] ) )
++				out[o++] = '.';
++			out[o++] = ' ';
++			lastWasSpace = true;
++			continue;
++		}
++
++		if( c < 0x20 || c == 0x7f )
++			c = ' ';
++
++		if( c == ' ' )
++		{
++			if( lastWasSpace )
++				continue;
++			lastWasSpace = true;
++		}
++		else
++		{
++			lastWasSpace = false;
++		}
++
++		out[o++] = (char)c;
++	}
++
++	while( o > 0 && ( out[o - 1] == ' ' || out[o - 1] == '.' ) )
++		o--;
++	out[o] = 0;
++}
++
++static void SpeakRaw( const char *clean, bool interrupt )
++{
++	if( !clean[0] )
++		return;
++
++	strncpy( s_szLastSpoken, clean, sizeof( s_szLastSpoken ) - 1 );
++	s_szLastSpoken[sizeof( s_szLastSpoken ) - 1] = 0;
++
++	if( access_debug && access_debug->value )
++		gEngfuncs.Con_Printf( "[access] %s\n", clean );
++
++	const int result = AccessTts_Speak( clean, interrupt ? 1 : 0 );
++	if( result == ACCESS_TTS_OK )
++	{
++		s_bWarned = false;
++	}
++	else if( !s_bWarned )
++	{
++		gEngfuncs.Con_Printf( result == ACCESS_TTS_UNAVAILABLE
++			? "[access] nvdaControllerClient.dll introuvable : annonces vocales désactivées.\n"
++			: "[access] NVDA ne répond pas (lancé ?).\n" );
++		s_bWarned = true;
++	}
++}
++
++static bool SpeechEnabled( cvar_t *category )
++{
++	if( !access_speech || !access_speech->value )
++		return false;
++	return !category || category->value != 0.0f;
++}
++
++void Access_Speak( const char *text, bool interrupt )
++{
++	if( !text || !SpeechEnabled( NULL ) )
++		return;
++
++	char clean[1024];
++	CleanForSpeech( text, clean, sizeof( clean ) );
++	SpeakRaw( clean, interrupt );
++}
++
++static void SpeakCoalesced( AccessSlot slot, const char *text )
++{
++	PendingAnnouncement &p = s_Pending[slot];
++	strncpy( p.text, text, sizeof( p.text ) - 1 );
++	p.text[sizeof( p.text ) - 1] = 0;
++	p.dueTick = AccessTts_Ticks() + ACCESS_COALESCE_MS;
++	p.pending = true;
++}
++
++void Access_Frame( void )
++{
++	// Apply the accessibility profile (key binds, cvars) once, after the engine
++	// has run the user's own config files, so these binds take precedence.
++	static bool s_bProfileApplied;
++	if( !s_bProfileApplied )
++	{
++		gEngfuncs.pfnClientCmd( "exec access.cfg\n" );
++		s_bProfileApplied = true;
++	}
++
++	// The client localizes at startup, before the user's config sets
++	// ui_language; reload the strings whenever the language changes so
++	// server menus and messages are spoken in the chosen language.
++	static char s_szLanguage[32];
++	static bool s_bLanguageKnown;
++	const char *language = gEngfuncs.pfnGetCvarString( "ui_language" );
++	if( language && ( !s_bLanguageKnown || strcmp( language, s_szLanguage )))
++	{
++		// The first sighting after startup may already differ from what
++		// Localize_Init() saw in CHud::Init, so always reload once.
++		Localize_Init();
++		snprintf( s_szLanguage, sizeof( s_szLanguage ), "%s", language );
++		s_bLanguageKnown = true;
++	}
++
++	const unsigned int now = AccessTts_Ticks();
++	for( int i = 0; i < ACCESS_SLOT_COUNT; i++ )
++	{
++		PendingAnnouncement &p = s_Pending[i];
++		if( p.pending && (int)( now - p.dueTick ) >= 0 )
++		{
++			p.pending = false;
++			if( SpeechEnabled( access_speech_hud ) )
++				Access_Speak( p.text );
++		}
++	}
++}
++
++bool Access_WantsTextMenus( void )
++{
++	return access_textmenus && access_textmenus->value && access_speech && access_speech->value;
++}
++
++// weapon_ak47 / ak47 -> readable name.
++static const char *FriendlyWeaponName( const char *name )
++{
++	static const struct { const char *id; const char *spoken; } table[] =
++	{
++		{ "p228", "P228" }, { "glock18", "Glock 18" }, { "glock", "Glock 18" }, { "usp", "USP" },
++		{ "deagle", "Desert Eagle" }, { "elite", "Dual Berettas" }, { "fiveseven", "Five-SeveN" },
++		{ "m3", "fusil à pompe M3" }, { "xm1014", "fusil à pompe XM1014" },
++		{ "mac10", "MAC-10" }, { "tmp", "TMP" }, { "mp5navy", "MP5" }, { "ump45", "UMP 45" }, { "p90", "P90" },
++		{ "galil", "Galil" }, { "famas", "FAMAS" }, { "ak47", "AK-47" }, { "m4a1", "M4A1" },
++		{ "sg552", "SG 552" }, { "aug", "AUG" }, { "scout", "Scout" }, { "awp", "AWP" },
++		{ "g3sg1", "G3SG1" }, { "sg550", "SG 550" }, { "m249", "mitrailleuse M249" },
++		{ "knife", "couteau" }, { "hegrenade", "grenade explosive" }, { "flashbang", "grenade flash" },
++		{ "smokegrenade", "grenade fumigène" }, { "c4", "bombe C4" },
++		{ "grenade", "grenade" }, { "worldspawn", "chute" }, { "trigger_hurt", "environnement" },
++	};
++
++	if( !name )
++		return "";
++	if( !strncmp( name, "weapon_", 7 ) )
++		name += 7;
++	for( size_t i = 0; i < ACCESS_ARRAYSIZE( table ); i++ )
++	{
++		if( !stricmp( name, table[i].id ) )
++			return table[i].spoken;
++	}
++	return name;
++}
++
++void Access_OnHealth( int health )
++{
++	AccessNav_OnHealth( health );
++	if( health == s_iHealth )
++		return;
++	s_iHealth = health;
++	if( health <= 0 )
++		return; // death is announced by the death notice
++
++	char buf[64];
++	snprintf( buf, sizeof( buf ), "Santé %d", health );
++	SpeakCoalesced( ACCESS_SLOT_HEALTH, buf );
++}
++
++void Access_OnArmor( int armor )
++{
++	if( armor == s_iArmor )
++		return;
++	s_iArmor = armor;
++
++	char buf[64];
++	snprintf( buf, sizeof( buf ), "Armure %d", armor );
++	SpeakCoalesced( ACCESS_SLOT_ARMOR, buf );
++}
++
++void Access_OnMoney( int money, int delta )
++{
++	const bool firstUpdate = s_iMoney < 0;
++	s_iMoney = money;
++	if( delta == 0 || firstUpdate )
++		return;
++
++	char buf[96];
++	snprintf( buf, sizeof( buf ), "%s%d dollars, total %d", delta > 0 ? "plus " : "moins ", delta > 0 ? delta : -delta, money );
++	SpeakCoalesced( ACCESS_SLOT_MONEY, buf );
++}
++
++void Access_OnWeaponSelected( const char *weaponName, int clip, int reserve )
++{
++	const char *spoken = FriendlyWeaponName( weaponName );
++	const bool changed = strcmp( s_szWeapon, spoken ) != 0;
++
++	strncpy( s_szWeapon, spoken, sizeof( s_szWeapon ) - 1 );
++	s_szWeapon[sizeof( s_szWeapon ) - 1] = 0;
++	s_iClip = clip;
++	s_iReserve = reserve;
++	AccessNav_OnClip( changed, clip );
++
++	if( !changed || !SpeechEnabled( access_speech_hud ) )
++		return;
++
++	char buf[160];
++	if( clip >= 0 )
++		snprintf( buf, sizeof( buf ), "%s, %d balles, réserve %d", spoken, clip, reserve );
++	else
++		snprintf( buf, sizeof( buf ), "%s", spoken );
++	Access_Speak( buf, true );
++}
++
++void Access_OnChatLine( const char *line )
++{
++	if( SpeechEnabled( access_speech_chat ) )
++		Access_Speak( line );
++}
++
++void Access_OnCenterMessage( const char *message )
++{
++	if( SpeechEnabled( NULL ) )
++		Access_Speak( message );
++}
++
++void Access_OnMenu( const char *menu )
++{
++	if( SpeechEnabled( NULL ) )
++		Access_Speak( menu, true );
++}
++
++void Access_OnDeath( const char *killer, const char *victim, const char *weapon,
++	bool headshot, bool localIsKiller, bool localIsVictim )
++{
++	if( !SpeechEnabled( access_speech_kills ) && !localIsVictim && !localIsKiller )
++		return;
++	if( !SpeechEnabled( NULL ) )
++		return;
++
++	const char *w = FriendlyWeaponName( weapon );
++	const char *hs = headshot ? ", tir à la tête" : "";
++	char buf[256];
++
++	if( localIsVictim && localIsKiller )
++		snprintf( buf, sizeof( buf ), "Vous vous êtes tué" );
++	else if( localIsVictim )
++		snprintf( buf, sizeof( buf ), "Vous êtes mort, tué par %s, %s%s", killer[0] ? killer : "le monde", w, hs );
++	else if( localIsKiller )
++		snprintf( buf, sizeof( buf ), "Vous avez tué %s, %s%s", victim, w, hs );
++	else if( killer[0] && strcmp( killer, victim ) )
++		snprintf( buf, sizeof( buf ), "%s a tué %s, %s%s", killer, victim, w, hs );
++	else
++		snprintf( buf, sizeof( buf ), "%s est mort", victim );
++
++	Access_Speak( buf, localIsVictim );
++}
++
++void Access_OnStatusIcon( const char *icon, int state )
++{
++	// C4 icon: state 1 = carrying the bomb, 2 = flashing inside a bomb site.
++	if( !stricmp( icon, "c4" ))
++	{
++		static int c4State;
++		if( state == c4State )
++			return;
++		const char *text = NULL;
++		if( state == 2 )
++			text = "Site de bombe, vous pouvez poser la bombe";
++		else if( state == 1 && c4State == 2 )
++			text = "Hors du site de bombe";
++		else if( state == 1 )
++			text = "Vous portez la bombe";
++		c4State = state;
++		if( text && SpeechEnabled( access_speech_hud ) )
++			Access_Speak( text );
++		return;
++	}
++
++	const bool enabled = state != 0;
++	static const struct { const char *icon; const char *enter; const char *leave; } zones[] =
++	{
++		{ "buyzone", "Zone d'achat", "Hors zone d'achat" },
++		{ "rescue", "Zone de sauvetage des otages", NULL },
++		{ "escape", "Zone d'évasion", NULL },
++		{ "vipsafety", "Zone de sécurité VIP", NULL },
++		{ "defuser", "Kit de désamorçage équipé", NULL },
++	};
++	static bool active[ACCESS_ARRAYSIZE( zones )];
++
++	for( size_t i = 0; i < ACCESS_ARRAYSIZE( zones ); i++ )
++	{
++		if( stricmp( icon, zones[i].icon ) )
++			continue;
++		// The server resends enabled icons (e.g. flashing C4); only announce transitions.
++		if( active[i] == enabled )
++			return;
++		active[i] = enabled;
++
++		const char *text = enabled ? zones[i].enter : zones[i].leave;
++		if( text && SpeechEnabled( access_speech_hud ) )
++			Access_Speak( text );
++		return;
++	}
++}
++
++static void Access_Cmd_Status( void )
++{
++	char buf[256];
++	int o = 0;
++
++	o += snprintf( buf + o, sizeof( buf ) - o, "Santé %d, armure %d", s_iHealth < 0 ? 0 : s_iHealth, s_iArmor < 0 ? 0 : s_iArmor );
++	if( s_iMoney >= 0 && o < (int)sizeof( buf ) )
++		o += snprintf( buf + o, sizeof( buf ) - o, ", %d dollars", s_iMoney );
++	if( s_szWeapon[0] && o < (int)sizeof( buf ) )
++	{
++		if( s_iClip >= 0 )
++			snprintf( buf + o, sizeof( buf ) - o, ", %s, %d balles, réserve %d", s_szWeapon, s_iClip, s_iReserve );
++		else
++			snprintf( buf + o, sizeof( buf ) - o, ", %s", s_szWeapon );
++	}
++
++	// Explicit request: speak even if HUD announcements are muted.
++	if( access_speech && access_speech->value )
++	{
++		char clean[256];
++		CleanForSpeech( buf, clean, sizeof( clean ) );
++		SpeakRaw( clean, true );
++	}
++}
++
++static void Access_Cmd_Repeat( void )
++{
++	if( s_szLastSpoken[0] && access_speech && access_speech->value )
++	{
++		char copy[sizeof( s_szLastSpoken )];
++		strcpy( copy, s_szLastSpoken );
++		SpeakRaw( copy, true );
++	}
++}
++
++static void Access_Cmd_Say( void )
++{
++	char buf[512];
++	buf[0] = 0;
++	for( int i = 1; i < gEngfuncs.Cmd_Argc(); i++ )
++	{
++		if( i > 1 )
++			strncat( buf, " ", sizeof( buf ) - strlen( buf ) - 1 );
++		strncat( buf, gEngfuncs.Cmd_Argv( i ), sizeof( buf ) - strlen( buf ) - 1 );
++	}
++	Access_Speak( buf, true );
++}
++
++static void Access_Cmd_Silence( void )
++{
++	AccessTts_Cancel();
++}
++
++void Access_Init( void )
++{
++	access_speech       = CVAR_CREATE( "access_speech", "1", FCVAR_ARCHIVE );
++	access_speech_chat  = CVAR_CREATE( "access_speech_chat", "1", FCVAR_ARCHIVE );
++	access_speech_kills = CVAR_CREATE( "access_speech_kills", "1", FCVAR_ARCHIVE );
++	access_speech_hud   = CVAR_CREATE( "access_speech_hud", "1", FCVAR_ARCHIVE );
++	access_textmenus    = CVAR_CREATE( "access_textmenus", "1", FCVAR_ARCHIVE );
++	access_debug        = CVAR_CREATE( "access_debug", "0", FCVAR_ARCHIVE );
++
++	gEngfuncs.pfnAddCommand( "access_status", Access_Cmd_Status );
++	gEngfuncs.pfnAddCommand( "access_repeat", Access_Cmd_Repeat );
++	gEngfuncs.pfnAddCommand( "access_say", Access_Cmd_Say );
++	gEngfuncs.pfnAddCommand( "access_silence", Access_Cmd_Silence );
++
++	AccessNav_Init();
++	AccessScreens_Init();
++}
+diff --git a/cl_dll/accessibility/access_speech.h b/cl_dll/accessibility/access_speech.h
+new file mode 100644
+index 0000000..eacd184
+--- /dev/null
++++ b/cl_dll/accessibility/access_speech.h
+@@ -0,0 +1,26 @@
++/*
++access_speech.h - screen reader (NVDA) announcements for blind players
++*/
++#pragma once
++
++// Registers cvars/commands and loads nvdaControllerClient.dll on demand.
++void Access_Init( void );
++// Flushes coalesced announcements (health/armor/money bursts). Call once per frame.
++void Access_Frame( void );
++// True when the server should send legacy text menus (spoken) instead of VGUI menus.
++bool Access_WantsTextMenus( void );
++
++// Speaks immediately; interrupt cancels whatever NVDA is currently saying.
++void Access_Speak( const char *text, bool interrupt = false );
++
++// Game event hooks, called from the HUD message handlers.
++void Access_OnHealth( int health );
++void Access_OnArmor( int armor );
++void Access_OnMoney( int money, int delta );
++void Access_OnWeaponSelected( const char *weaponName, int clip, int reserve );
++void Access_OnChatLine( const char *line );
++void Access_OnCenterMessage( const char *message );
++void Access_OnMenu( const char *menu );
++void Access_OnDeath( const char *killer, const char *victim, const char *weapon,
++	bool headshot, bool localIsKiller, bool localIsVictim );
++void Access_OnStatusIcon( const char *icon, int state );
+diff --git a/cl_dll/accessibility/access_tts.c b/cl_dll/accessibility/access_tts.c
+new file mode 100644
+index 0000000..ce7f9a8
+--- /dev/null
++++ b/cl_dll/accessibility/access_tts.c
+@@ -0,0 +1,148 @@
++/*
++access_tts.c - minimal screen reader output (NVDA controller client)
++*/
++
++#include "access_tts.h"
++
++#ifdef _WIN32
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++// Optional transcript: when ACCESS_TTS_LOG names a file, every utterance is
++// appended to it (used by the automated menu tests, and handy for debugging).
++static void LogUtterance( const char *utf8, int interrupt )
++{
++	static int checked;
++	static char path[MAX_PATH];
++	FILE *f;
++
++	if( !checked )
++	{
++		const char *env = getenv( "ACCESS_TTS_LOG" );
++		checked = 1;
++		if( env )
++			snprintf( path, sizeof( path ), "%s", env );
++	}
++	if( !path[0] )
++		return;
++	f = fopen( path, "ab" );
++	if( !f )
++		return;
++	// "! " interrupting speech, "  " queued speech, "# " diagnostic only
++	fprintf( f, "%s%s\n", interrupt == 2 ? "# " : ( interrupt ? "! " : "  " ), utf8 );
++	fclose( f );
++}
++
++typedef unsigned long ( __stdcall *nvdaSpeakText_t )( const wchar_t *text );
++typedef unsigned long ( __stdcall *nvdaCancelSpeech_t )( void );
++
++static int s_loadTried;
++static nvdaSpeakText_t s_pfnSpeakText;
++static nvdaCancelSpeech_t s_pfnCancelSpeech;
++
++static void LoadNvda( void )
++{
++	HMODULE self = NULL, lib = NULL;
++	wchar_t path[MAX_PATH];
++
++	if( s_loadTried )
++		return;
++	s_loadTried = 1;
++
++	// Next to the calling module first (cl_dlls\ for client and menu, engine dir for xash.dll).
++	if( GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++		(LPCWSTR)&LoadNvda, &self ) )
++	{
++		DWORD len = GetModuleFileNameW( self, path, MAX_PATH );
++		wchar_t *slash = len > 0 && len < MAX_PATH ? wcsrchr( path, L'\\' ) : NULL;
++		if( slash && ( slash - path ) + 32 < MAX_PATH )
++		{
++			wcscpy( slash + 1, L"nvdaControllerClient.dll" );
++			lib = LoadLibraryW( path );
++		}
++	}
++	if( !lib )
++		lib = LoadLibraryW( L"nvdaControllerClient.dll" );
++	if( !lib )
++		return;
++
++	s_pfnSpeakText = (nvdaSpeakText_t)GetProcAddress( lib, "nvdaController_speakText" );
++	s_pfnCancelSpeech = (nvdaCancelSpeech_t)GetProcAddress( lib, "nvdaController_cancelSpeech" );
++	if( !s_pfnSpeakText )
++		FreeLibrary( lib );
++}
++
++void AccessTts_Log( const char *utf8 )
++{
++	LogUtterance( utf8, 2 );
++}
++
++int AccessTts_Speak( const char *utf8, int interrupt )
++{
++	wchar_t wide[2048];
++	int n;
++
++	if( !utf8 || !utf8[0] )
++		return ACCESS_TTS_OK;
++
++	LogUtterance( utf8, interrupt );
++	LoadNvda();
++	if( !s_pfnSpeakText )
++		return ACCESS_TTS_UNAVAILABLE;
++
++	n = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, (int)( sizeof( wide ) / sizeof( wide[0] ) ) );
++	if( n == 0 )
++		n = MultiByteToWideChar( CP_ACP, 0, utf8, -1, wide, (int)( sizeof( wide ) / sizeof( wide[0] ) ) );
++	if( n == 0 )
++		return ACCESS_TTS_OK;	// too long or unconvertible: drop silently
++	wide[sizeof( wide ) / sizeof( wide[0] ) - 1] = 0;
++
++	if( interrupt && s_pfnCancelSpeech )
++		s_pfnCancelSpeech();
++
++	return s_pfnSpeakText( wide ) == 0 ? ACCESS_TTS_OK : ACCESS_TTS_NOT_RUNNING;
++}
++
++void AccessTts_Cancel( void )
++{
++	LoadNvda();
++	if( s_pfnCancelSpeech )
++		s_pfnCancelSpeech();
++}
++
++unsigned int AccessTts_Ticks( void )
++{
++	return (unsigned int)GetTickCount();
++}
++
++#else // !_WIN32
++
++void AccessTts_Log( const char *utf8 )
++{
++	(void)utf8;
++}
++
++#include <time.h>
++
++int AccessTts_Speak( const char *utf8, int interrupt )
++{
++	(void)utf8;
++	(void)interrupt;
++	return ACCESS_TTS_UNAVAILABLE;
++}
++
++void AccessTts_Cancel( void )
++{
++}
++
++unsigned int AccessTts_Ticks( void )
++{
++	struct timespec ts;
++	clock_gettime( CLOCK_MONOTONIC, &ts );
++	return (unsigned int)( ts.tv_sec * 1000u + ts.tv_nsec / 1000000u );
++}
++
++#endif
+diff --git a/cl_dll/accessibility/access_tts.h b/cl_dll/accessibility/access_tts.h
+new file mode 100644
+index 0000000..14ddaef
+--- /dev/null
++++ b/cl_dll/accessibility/access_tts.h
+@@ -0,0 +1,36 @@
++/*
++access_tts.h - minimal screen reader output (NVDA controller client), shared by
++the client (client.dll), the menus (menu.dll) and the engine (xash.dll).
++
++Plain C and free of engine headers, so it can be dropped into any of the three
++code bases; nvdaControllerClient.dll is loaded at runtime from the module's own
++folder, then from the normal DLL search path.
++*/
++#ifndef ACCESS_TTS_H
++#define ACCESS_TTS_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum
++{
++	ACCESS_TTS_OK = 1,
++	ACCESS_TTS_NOT_RUNNING = 0,		// DLL loaded but NVDA did not accept the text
++	ACCESS_TTS_UNAVAILABLE = -1		// no nvdaControllerClient.dll / unsupported platform
++};
++
++// Speaks UTF-8 text (invalid UTF-8 falls back to the ANSI code page).
++// interrupt != 0 cancels whatever is being spoken first.
++int AccessTts_Speak( const char *utf8, int interrupt );
++void AccessTts_Cancel( void );
++// Millisecond tick counter (wraps; compare with signed differences).
++unsigned int AccessTts_Ticks( void );
++// Writes a diagnostic line to the ACCESS_TTS_LOG transcript only (never spoken).
++void AccessTts_Log( const char *utf8 );
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // ACCESS_TTS_H
+diff --git a/cl_dll/ammo.cpp b/cl_dll/ammo.cpp
+index 0dd4503..8a6e826 100644
+--- a/cl_dll/ammo.cpp
++++ b/cl_dll/ammo.cpp
+@@ -19,6 +19,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cvardef.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+@@ -629,6 +630,9 @@ int CHudAmmo::MsgFunc_CurWeapon(const char *pszName, int iSize, void *pbuf )
+ 
+ 	m_pWeapon = pWeapon;
+ 
++	Access_OnWeaponSelected( pWeapon->szName, pWeapon->iAmmoType > 0 ? pWeapon->iClip : -1,
++		pWeapon->iAmmoType > 0 ? gWR.CountAmmo( pWeapon->iAmmoType ) : 0 );
++
+ 	if( gHUD.m_iFOV >= 90 )
+ 	{ // normal crosshairs
+ 		if( fOnTarget && m_pWeapon->hAutoaim )
+diff --git a/cl_dll/battery.cpp b/cl_dll/battery.cpp
+index 71f79ee..36b9050 100644
+--- a/cl_dll/battery.cpp
++++ b/cl_dll/battery.cpp
+@@ -19,6 +19,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "parsemsg.h"
+ #include "cl_util.h"
+ #include "draw_util.h"
+@@ -66,6 +67,8 @@ int CHudBattery:: MsgFunc_Battery(const char *pszName, int iSize, void *pbuf )
+ 			m_enArmorType = Vest;
+ 	}
+ 
++	Access_OnArmor( x );
++
+ 	return 1;
+ }
+ 
+diff --git a/cl_dll/cdll_int.cpp b/cl_dll/cdll_int.cpp
+index 4f5a9e8..4127c7a 100644
+--- a/cl_dll/cdll_int.cpp
++++ b/cl_dll/cdll_int.cpp
+@@ -19,6 +19,9 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
++#include "accessibility/access_nav.h"
++#include "accessibility/access_screens.h"
+ #include "netadr.h"
+ #include "pmtrace.h"
+ 
+@@ -125,6 +128,7 @@ HUD_Shutdown
+ */
+ void DLLEXPORT HUD_Shutdown( void )
+ {
++	AccessNav_Shutdown();
+ 	gHUD.Shutdown();
+ 	Input_Shutdown();
+ 	Localize_Free();
+@@ -299,6 +303,9 @@ int DLLEXPORT HUD_Redraw( float time, int intermission )
+ {
+ 	gHUD.Redraw( time, intermission );
+ 
++	AccessNav_Frame();
++	AccessScreens_Frame();
++
+ 	return 1;
+ }
+ 
+@@ -346,6 +353,19 @@ Called by engine every frame that client .dll is loaded
+ 
+ void DLLEXPORT HUD_Frame( double time )
+ {
++	Access_Frame();
++
++	// Screen reader users get the numbered text menus, which are spoken by the
++	// accessibility layer (the server sends ShowMenu when _vgui_menus is 0, and
++	// _extended_menus 0 keeps radio menus as text instead of touch panels).
++	if ( Access_WantsTextMenus() )
++	{
++		if ( CVAR_GET_FLOAT( "_vgui_menus" ) != 0.0f )
++			gEngfuncs.Cvar_SetValue( "_vgui_menus", 0.0f );
++		if ( CVAR_GET_FLOAT( "_extended_menus" ) != 0.0f )
++			gEngfuncs.Cvar_SetValue( "_extended_menus", 0.0f );
++	}
++
+ #ifdef _CS16CLIENT_ENABLE_GSRC_SUPPORT
+ 	gEngfuncs.VGui_ViewportPaintBackground(HUD_GetRect());
+ #endif
+diff --git a/cl_dll/death.cpp b/cl_dll/death.cpp
+index 4a47e75..75ace47 100644
+--- a/cl_dll/death.cpp
++++ b/cl_dll/death.cpp
+@@ -16,6 +16,7 @@
+ // death notice
+ //
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ 
+@@ -261,6 +262,14 @@ int CHudDeathNotice :: MsgFunc_DeathMsg( const char *pszName, int iSize, void *p
+ 
+ 	rgDeathNoticeList[i].flDisplayTime = gHUD.m_flTime + hud_deathnotice_time->value;
+ 
++	if ( !rgDeathNoticeList[i].bNonPlayerKill )
++	{
++		const cl_entity_t *local = gEngfuncs.GetLocalPlayer();
++		const int localIndex = local ? local->index : 0;
++		Access_OnDeath( rgDeathNoticeList[i].szKiller, rgDeathNoticeList[i].szVictim, killedwith + 2,
++			headshot != 0, killer != 0 && killer == localIndex, victim == localIndex );
++	}
++
+ 	// Play kill sound
+ 	if ((killer_this_player || g_iUser2 == killer) &&
+ 		!rgDeathNoticeList[i].bNonPlayerKill &&
+diff --git a/cl_dll/health.cpp b/cl_dll/health.cpp
+index 117e099..d1f273a 100644
+--- a/cl_dll/health.cpp
++++ b/cl_dll/health.cpp
+@@ -23,6 +23,8 @@
+ #include "math.h"
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
++#include "accessibility/access_nav.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ #include <string.h>
+@@ -138,6 +140,8 @@ int CHudHealth:: MsgFunc_Health(const char *pszName,  int iSize, void *pbuf )
+ 		m_iHealth = x;
+ 	}
+ 
++	Access_OnHealth( x );
++
+ 	return 1;
+ }
+ 
+@@ -161,6 +165,7 @@ int CHudHealth:: MsgFunc_Damage(const char *pszName,  int iSize, void *pbuf )
+ 	if ( damageTaken > 0 || armor > 0 )
+ 	{
+ 		CalcDamageDirection(vecFrom);
++		AccessNav_OnDamage( vecFrom, damageTaken + armor );
+ 		if( g_iXash )
+ 		{
+ 			float time = damageTaken * 4.0f + armor * 2.0f;
+diff --git a/cl_dll/hud.cpp b/cl_dll/hud.cpp
+index 9ae956c..690d375 100644
+--- a/cl_dll/hud.cpp
++++ b/cl_dll/hud.cpp
+@@ -21,6 +21,7 @@
+ #include <new>
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include <string.h>
+ #include <stdio.h>
+@@ -337,6 +338,8 @@ void CHud :: Init( void )
+ 	cl_min_t     = CVAR_CREATE( "cl_min_t", "1", FCVAR_ARCHIVE );
+ 	cl_min_ct    = CVAR_CREATE( "cl_min_ct", "2", FCVAR_ARCHIVE );
+ 	default_fov  = CVAR_CREATE( "default_fov", "90", 0 );
++
++	Access_Init();
+ 	m_pCvarDraw  = CVAR_CREATE( "hud_draw", "1", FCVAR_ARCHIVE );
+ 	fastsprites  = CVAR_CREATE( "fastsprites", "0", FCVAR_ARCHIVE );
+ 	cl_gunsmoke  = CVAR_CREATE( "cl_gunsmoke", "0", FCVAR_ARCHIVE );
+diff --git a/cl_dll/hud.h b/cl_dll/hud.h
+index f23bb7c..bcb79b5 100644
+--- a/cl_dll/hud.h
++++ b/cl_dll/hud.h
+@@ -807,6 +807,11 @@ public:
+ 	// show the timer
+ 	// [empty]
+ 	CHudMsgFunc(ShowTimer);
++	int GetRemainingTime( float currentTime ) const
++	{
++		const int remaining = (int)( m_iTime + m_fStartTime - currentTime );
++		return remaining > 0 ? remaining : 0;
++	}
+ 
+ 	int m_right;
+ private:
+diff --git a/cl_dll/hud/MOTD.cpp b/cl_dll/hud/MOTD.cpp
+index 83208f5..fdb0a75 100644
+--- a/cl_dll/hud/MOTD.cpp
++++ b/cl_dll/hud/MOTD.cpp
+@@ -19,6 +19,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_screens.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ #include "kbutton.h"
+@@ -145,6 +146,9 @@ int CHudMOTD :: MsgFunc_MOTD( const char *pszName, int iSize, void *pbuf )
+ 	int is_finished = reader.ReadByte();
+ 	m_szMOTD.Append( reader.ReadString() );
+ 
++	if ( is_finished )
++		AccessScreens_OnMotd( m_szMOTD.String() );
++
+ 	// we still don't support html tags in motd :(
+ 	if( strcasestr( m_szMOTD.String(), "<!DOCTYPE HTML>" ) )
+ 	{
+diff --git a/cl_dll/hud/money.cpp b/cl_dll/hud/money.cpp
+index d02ee2d..47e81d3 100644
+--- a/cl_dll/hud/money.cpp
++++ b/cl_dll/hud/money.cpp
+@@ -33,6 +33,7 @@ version.
+ #include "math.h"
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ #include <string.h>
+@@ -154,6 +155,7 @@ int CHudMoney::MsgFunc_Money(const char *pszName, int iSize, void *pbuf)
+ 	m_iMoneyCount = buf.ReadLong();
+ 	gEngfuncs.Cvar_SetValue( gHUD.cscl_currentmoney->name, m_iMoneyCount );
+ 	m_iDelta = m_iMoneyCount - iOldCount;
++	Access_OnMoney( m_iMoneyCount, m_iDelta );
+ 	m_fFade = 5.0f; //fade for 5 seconds
+ 	m_iFlags |= HUD_DRAW;
+ 	return 1;
+diff --git a/cl_dll/menu.cpp b/cl_dll/menu.cpp
+index 08c10d8..c431bce 100644
+--- a/cl_dll/menu.cpp
++++ b/cl_dll/menu.cpp
+@@ -18,6 +18,7 @@
+ // generic menu handler
+ //
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ #include "com_weapons.h"
+@@ -214,6 +215,8 @@ int CHudMenu :: MsgFunc_ShowMenu( const char *pszName, int iSize, void *pbuf )
+ 			strlcpy( g_szMenuString, temp, sizeof( g_szMenuString ) );
+ 			free( temp );
+ 		}
++
++		Access_OnMenu( g_szMenuString );
+ 	}
+ 
+ 	m_fMenuDisplayed = 1;
+diff --git a/cl_dll/message.cpp b/cl_dll/message.cpp
+index a3d14df..e97ea31 100644
+--- a/cl_dll/message.cpp
++++ b/cl_dll/message.cpp
+@@ -19,6 +19,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_screens.h"
+ #include "cl_util.h"
+ #include <string.h>
+ #include <stdio.h>
+@@ -626,6 +627,8 @@ void CHudMessage::MessageAdd(client_textmessage_t * newMessage )
+ {
+ 	client_textmessage_t *message;
+ 
++	AccessScreens_OnHudText( newMessage->pMessage );
++
+ 	m_parms.time = gHUD.m_flTime;
+ 
+ 	// Turn on drawing
+diff --git a/cl_dll/saytext.cpp b/cl_dll/saytext.cpp
+index 8fe0064..8c23d93 100644
+--- a/cl_dll/saytext.cpp
++++ b/cl_dll/saytext.cpp
+@@ -19,6 +19,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ 
+@@ -353,6 +354,8 @@ int CHudSayText :: MsgFunc_SayText( const char *pszName, int iSize, void *pbuf )
+ 
+ void CHudSayText :: SayTextPrint( const char *pszBuf, int iBufSize, int clientIndex )
+ {
++	Access_OnChatLine( pszBuf );
++
+ 	if ( m_HUD_saytext_console->value && pszBuf && *pszBuf )
+ 	{
+ 		// Print it straight to the console
+diff --git a/cl_dll/status_icons.cpp b/cl_dll/status_icons.cpp
+index 1be76c1..6f044bd 100644
+--- a/cl_dll/status_icons.cpp
++++ b/cl_dll/status_icons.cpp
+@@ -16,6 +16,7 @@
+ // status_icons.cpp
+ //
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include "const.h"
+ #include "entity_state.h"
+@@ -88,6 +89,8 @@ int CHudStatusIcons::MsgFunc_StatusIcon( const char *pszName, int iSize, void *p
+ 	int ShouldEnable = reader.ReadByte();
+ 	char *pszIconName = reader.ReadString();
+ 
++	Access_OnStatusIcon( pszIconName, ShouldEnable );
++
+ 	if ( ShouldEnable )
+ 	{
+ 		int r = reader.ReadByte();
+diff --git a/cl_dll/statusbar.cpp b/cl_dll/statusbar.cpp
+index a33f2e0..1c8abd7 100644
+--- a/cl_dll/statusbar.cpp
++++ b/cl_dll/statusbar.cpp
+@@ -20,6 +20,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_screens.h"
+ #include "cl_util.h"
+ #include "parsemsg.h"
+ 
+@@ -218,6 +219,17 @@ int CHudStatusBar :: Draw( float fTime )
+ 			ParseStatusString( i );
+ 		}
+ 		m_bReparseString = FALSE;
++
++		char spoken[MAX_STATUSBAR_LINES * MAX_STATUSTEXT_LENGTH + MAX_STATUSBAR_LINES * 2] = "";
++		for ( int i = 0; i < MAX_STATUSBAR_LINES; i++ )
++		{
++			if ( !m_szStatusBar[i][0] )
++				continue;
++			if ( spoken[0] )
++				strncat( spoken, ". ", sizeof( spoken ) - strlen( spoken ) - 1 );
++			strncat( spoken, m_szStatusBar[i], sizeof( spoken ) - strlen( spoken ) - 1 );
++		}
++		AccessScreens_OnStatusBar( spoken );
+ 	}
+ 
+ 	if( g_iUser1 > 0 )
+diff --git a/cl_dll/text_message.cpp b/cl_dll/text_message.cpp
+index c298877..e98d3e1 100644
+--- a/cl_dll/text_message.cpp
++++ b/cl_dll/text_message.cpp
+@@ -21,6 +21,7 @@
+ //
+ 
+ #include "hud.h"
++#include "accessibility/access_speech.h"
+ #include "cl_util.h"
+ #include <string.h>
+ #include <stdio.h>
+@@ -224,6 +225,7 @@ int CHudTextMessage::MsgFunc_TextMsg( const char *pszName, int iSize, void *pbuf
+ 		DrawUtils::DrawConsoleString( (ScreenWidth - len) / 2, ScreenHeight / 3, psz );
+ 
+ 		CenterPrint( psz );
++		Access_OnCenterMessage( psz );
+ 		break;
+ 	}
+ 	case HUD_PRINTNOTIFY:
+diff --git a/docs/accessibility-design.md b/docs/accessibility-design.md
+new file mode 100644
+index 0000000..9bf61da
+--- /dev/null
++++ b/docs/accessibility-design.md
+@@ -0,0 +1,165 @@
++# Accessibility design: CS 1.6 for blind players
++
++Goal: a blind player can launch a game, pick a team and weapons, move around a map, find objectives,
++detect and fight enemies, and follow the state of the round using NVDA speech and procedurally
++generated sounds only.
++
++## Principles
++
++1. **Sounds for continuous space, speech for discrete facts.** Walls, directions, enemies and aim
++   change every frame, so they are sounds. Names, numbers and menus are speech.
++2. **One sound grammar for everything.** Every cue is placed the same way:
++   - left/right = stereo pan (equal power), from the angle relative to where you look;
++   - **behind = muffled** (low-pass filter, slightly duller), so front and back are never confused;
++   - **higher pitch = above you** (±half an octave straight up/down), or closer for sonar and scan;
++   - faster repetition = closer or more urgent.
++3. **Each cue has a single meaning and a distinct timbre** (noise tap, bell, buzz, chirp…), so cues
++   can overlap without being mistaken for each other or for game sounds.
++4. **Directions are spoken as clock hours** (12 = ahead, 3 = right, 6 = behind, 9 = left) and
++   distances in metres. Map directions use compass words (nord, est…), with north = +Y as on the
++   overview.
++5. **Fair play**: enemies are only sonified when there is a clear line of sight from your eyes, the
++   information a sighted player has on screen. `access_enemy_fov 120` restricts it to the front.
++   Nothing aims or moves for the player.
++6. **Nothing is mandatory**: every speech category and cue family has its own cvar, and the whole
++   layer degrades silently when NVDA or XAudio2 is missing.
++
++## Sound vocabulary
++
++All sounds are synthesized at startup (`access_audio.cpp`, no files). Samples are exported to
++`analysis/sons/*.wav` for learning.
++
++| Cue | Timbre | Meaning | Behaviour |
++|---|---|---|---|
++| `WALL_FRONT` | tap + ring | wall ahead | sonar, 0° |
++| `WALL_TAP` | cane tap | wall at 45°, 90°, 180° | sonar round-robin, louder/higher when closer |
++| `LEDGE` | falling chirp | drop ahead in your walking direction | lower pitch = deeper; speech "chute dangereuse" over ~5.5 m |
++| `STEP` | rising chirp | knee-high obstacle you can jump | |
++| `SCAN` | sine blip | radar sweep: wall in that direction | high = near, low = far |
++| `OPENING` | breath of noise | radar sweep: open space (> 12 m) | corridors, doors, open areas |
++| `BEACON` | bell | next point of the guidance path | from the farthest path point in line of sight, so it leads around corners; faster when near |
++| `ARRIVED` | rising arpeggio | guidance target reached | + speech |
++| `ENEMY_SPOTTED` | sharp rising blip | an enemy just came into view | once per sighting |
++| `ENEMY` | two-tone buzz | visible enemy | the 3 nearest, 0.3 s (close) to 1 s (far) |
++| `TEAMMATE` | soft blip | teammate within ~9 m | every 1.2 s |
++| `AIM` | pure tone | crosshair within 30° of a visible enemy | panned toward the enemy; pitch rises and repeats faster as the error shrinks |
++| `AIM_LOCK` | bright click | crosshair on the enemy's torso | angle = torso half-width at that range |
++| `DAMAGE` | low thud | you were hit | placed at the damage source; louder for heavy hits |
++| `GRENADE` | metallic rattle | live grenade within ~23 m | + speech with the grenade type ("Flash, détournez-vous") |
++| `HEARTBEAT` | double thump | health ≤ 25 | faster when lower |
++| `AMMO_LOW` | dry double click | magazine ≤ 20 % | + speech "Chargeur vide" at 0 |
++| `NORTH` | wood tick | your view crosses north | compass by ear |
++| `OBJECTIVE` | marimba | guidance beacon when the target is the bomb (dropped or planted) | position follows the radar |
++
++## Speech
++
++| Source | What is spoken |
++|---|---|
++| HUD | health, armour, money (+/−, merged over 400 ms), weapon + ammo on switch, zone entry (buy zone, bomb site, rescue, VIP, escape, defuse kit) |
++| Messages | chat, radio, centre messages (round result, bomb planted…), hint texts (HudText), MOTD (HTML stripped) |
++| Aim target | the status bar line ("Ennemi : nom, santé 80 %") when it changes |
++| Kills | yours always; others with `access_speech_kills` |
++| Round | 1 min / 30 s / 10 s left; end-of-map scoreboard |
++| Spectator | camera mode and watched player |
++| Menus | every text menu, read whole and interrupting (team, class, buy, radio, votes) |
++
++## Screens and menus coverage
++
++The game runs on Xash3D FWGS, whose engine, menus and client are all open source, so every screen
++has a speech path. Nothing is left to Valve's closed `GameUI.dll`.
++
++| Screen | How it is spoken | Layer |
++|---|---|---|
++| Main menu, in-game Esc menu, options (video, audio, controls, mouse, game), create game, server browser, key bindings, quit / confirmation dialogs, connection progress | window title on open, focused item with type and value ("Volume des effets sonores, curseur, 60 pour cent"), value changes, table rows with column headers, dialog questions | menu (`mainui_cpp/menu_access.cpp`) |
++| Text fields in menus (player name, server address, password) | each typed / deleted character, character under the cursor, masked input spoken as "étoile" | menu |
++| Console | "Console" on open with the keys to use, typed characters, history recall, completion, every printed line while open, "Console fermée" | engine (`engine/client/accessibility/con_access.c`) |
++| Chat input (say / say_team) | "Message à tous" / "Message à votre équipe", typed characters, "Message envoyé" or "Message annulé"; received chat is spoken by the client | engine + client |
++| Team, appearance, buy, radio, vote, AMX menus | read in full when shown, choose with number keys (`access_textmenus 1` asks the server for text menus) | client |
++| HUD, round, kills, hints, MOTD, scoreboard, timer, spectator | as in the Speech section | client |
++| Radar / overview | replaced by guidance, `access_where`, `access_scan`, teammate cues | client |
++
++Menu rules for keyboard-only use:
++- Keyboard focus never moves with the mouse while `access_menu_mouse 0` (default): the menu's pointer
++  is parked off screen, so a mouse resting on a button cannot steal the focus.
++- Focus changes are spoken once stable for 80 ms (no flicker during animations); banners and pictures
++  are skipped automatically when the arrows land on them.
++- The focus is never moved programmatically when a window opens, because buttons activate on key
++  release and the Enter that opened the window is still being released.
++- The server browser's tab selector (Internet / Favorites / History) was mouse-only; Enter now cycles it.
++
++Languages: `ui_language french` loads the official French game strings plus two files added for this
++project: `cstrike/resource/mainui_french.txt` (394 menu strings, including the help texts) and a
++French `cstrike/titles.txt` for the numbered menus and messages (original kept as `titles_english.txt`).
++
++Keyboard layout: Xash binds keys by physical position (QWERTY). On AZERTY, move with Z Q S D; the
++default radio keys are W X C. The accessibility keys (F3-F12, H, J, I, O) are at the same place on both.
++
++## Controls
++
++| Key | Command | |
++|---|---|---|
++| F3 | `access_scores` | scoreboard |
++| F4 | `access_time` | round time |
++| F6 | `access_status` | health, armour, money, weapon, ammo |
++| F7 | `access_repeat` | repeat last announcement |
++| F8 | `access_silence` | stop speech |
++| F9 / F10 | `access_target_next` / `_prev` | choose a guidance target (bomb, sites, hostages, rescue zones, spawns), spoken with path length and clock direction |
++| F11 | `access_where` | heading, current target, two nearest objectives |
++| F12 | `access_target_stop` | stop guidance |
++| H | `access_scan` | 1.4 s radar sweep clockwise from ahead + spoken summary of openings and nearest wall |
++| J | `access_enemies_list` | visible enemies with clock direction and distance |
++| I | `access_compass` | heading in words and degrees |
++| O | `access_motd` | reread the server message |
++
++`cstrike/access.cfg` holds these binds and every option; the client runs it once at startup, after the
++user's own config, so the accessibility binds always apply.
++
++## Architecture
++
++```
++CS16_Xash/                 playable game (Xash3D FWGS + CS 1.6 assets from the original installer)
++  xash.dll                 engine, built from repos/xash3d-fwgs (branch accessibility-nvda)
++    engine/client/accessibility/con_access.c   console and chat input speech
++  cstrike/cl_dlls/client.dll   built from repos/cs16-client (branch accessibility-nvda)
++    cl_dll/accessibility/
++      access_tts.*       NVDA controller client, loaded at runtime (shared by all three layers)
++      access_speech.*    HUD / chat / menus / kills speech, access_status, profile + language reload
++      access_screens.*   scoreboard, timer, MOTD, hints, aim status bar, spectator, intermission
++      access_audio.*     XAudio2 on its own COM thread; 19 synthesized cues; pan / low-pass / pitch
++      access_map.*       BSP objectives + .nav mesh + A* with portal waypoints
++      access_nav.*       sonar, ledges, scan, guidance, players, aim, grenades, damage, body
++  cstrike/cl_dlls/menu.dll     built from repos/cs16-client/3rdparty/mainui_cpp (branch accessibility-nvda)
++    menu_access.cpp        per-frame window / focus / value observer
++  nvdaControllerClient.dll     NVDA 2026.2 controller client (x86), next to the engine and in cl_dlls
++```
++
++`access_tts` writes a transcript of every utterance to the file named by the environment variable
++`ACCESS_TTS_LOG` (lines `!` interrupting, `  ` queued, `#` diagnostics such as window structure and the
++first use of each sound). The automated tests read it.
++
++Build: `tools/scripts/build_velaron.bat` (client, menu, server) and `tools/scripts/build_xash.bat`
++(engine), MSVC x86 with the local NuGet Windows SDK (`tools/winsdk`), no system SDK needed.
++
++## Verification
++
++Automated, on this machine, with NVDA running:
++- `tools/scripts/menu_test.ps1` launches the game, posts real key presses to its window and prints the
++  speech transcript. Covered: main menu, Options, Audio (slider changes), Video, Load game (table,
++  unavailable buttons), quit dialog, Esc back-navigation; in game on de_dust2: team / appearance / buy /
++  radio menus in French, HUD, F3 F4 F6 F9 F11 H I J, chat typing and sending, console typing, command
++  output and history, walking with sounds (walls, ledge, step, scan, openings, beacon).
++- `tools/navtools/test_access_map.exe`: all 25 stock maps parse, 0 unreachable spawn-to-objective paths.
++- `tools/audiotest/test_access_audio.exe`: every cue at 4 positions, levels checked.
++
++- Full round against 5 bots on de_dust2: enemy spotted / enemy pulses (panned right, matching "3 heures"),
++  damage from the right, health drops, heartbeat, death announcement, round result, spectator, teammate cue,
++  new-round money, bot radio in French.
++
++- Aim: 4 bots frozen with `bot_zombie 1` near the player, view turned in ~5° steps: "visée" tone panned
++  toward the enemy, then "visée verrouillée" when the crosshair crossed it; `access_enemies_list` followed
++  the enemy around the clock (7 h, 4 h, 12 h, 9 h at 22 m).
++- Grenades: own HE grenade tracked by a quiet rattle without speech; enemy grenades (bots limited to
++  knives and grenades with `bot_allow_*`) announced "Grenade explosive" + rattle from the right direction.
++  Test configs are in `tools/tests/`.
++
++Not verified yet: a human playtest.

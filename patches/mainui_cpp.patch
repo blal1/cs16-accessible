@@ -1,0 +1,1143 @@
+diff --git a/BaseMenu.cpp b/BaseMenu.cpp
+index 1350664..424bb8e 100755
+--- a/BaseMenu.cpp
++++ b/BaseMenu.cpp
+@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ */
+ #include "extdll_menu.h"
+ #include "BaseMenu.h"
++#include "menu_access.h"
+ #include "PicButton.h"
+ #include "keydefs.h"
+ #include "Utils.h"
+@@ -623,6 +624,8 @@ void UI_UpdateMenu( float flTime )
+ 	if( !uiStatic.initialized )
+ 		return;
+ 
++	MenuAccess_ParkPointer();	// before any window opens this frame
++
+ 	static bool loadStuff = true;
+ 
+ 	// can't do this in Init, since these are dependent on cvar values
+@@ -656,6 +659,9 @@ void UI_UpdateMenu( float flTime )
+ 	// advance global time
+ 	uiStatic.realTime = flTime * 1000;
+ 
++	// speak window, focus and value changes for screen reader users
++	MenuAccess_Frame();
++
+ 	// let's use engine credits "feature" for drawing client windows
+ 	if( uiStatic.client.IsActive( ))
+ 		uiStatic.client.Update();
+@@ -768,6 +774,11 @@ void UI_MouseMove( int x, int y )
+ 	if( !clientActive && !menuActive )
+ 		return;
+ 
++	// Screen reader users navigate with the keyboard; a mouse resting anywhere
++	// must not steal the focus. access_menu_mouse 1 restores mouse hovering.
++	if( !MenuAccess_MouseEnabled() )
++		return;
++
+ 	if( uiStatic.cursorX == x && uiStatic.cursorY == y )
+ 		return;
+ 
+@@ -1067,6 +1078,7 @@ int UI_VidInit( void )
+ 	// move cursor to screen center
+ 	uiStatic.cursorX = ScreenWidth / 2;
+ 	uiStatic.cursorY = ScreenHeight / 2;
++	MenuAccess_ParkPointer();	// the centre of the screen is often on a button
+ 	uiStatic.outlineWidth = 4;
+ 
+ 	UI_ScaleCoords( NULL, NULL, &uiStatic.outlineWidth, NULL );
+@@ -1158,6 +1170,7 @@ void UI_Init( void )
+ 	ui_showmodels = EngFuncs::CvarRegister( "ui_showmodels", "0", FCVAR_ARCHIVE );
+ 	ui_showclassmodels = EngFuncs::CvarRegister( "ui_showclassmodels", "1", FCVAR_ARCHIVE );
+ 	ui_show_window_stack = EngFuncs::CvarRegister( "ui_show_window_stack", "0", FCVAR_ARCHIVE );
++	MenuAccess_Init();
+ 	ui_borderclip = EngFuncs::CvarRegister( "ui_borderclip", "0", FCVAR_ARCHIVE );
+ 	ui_prefer_won_background = EngFuncs::CvarRegister( "ui_prefer_won_background", "0", FCVAR_ARCHIVE );
+ 	ui_background_stretch = EngFuncs::CvarRegister( "ui_background_stretch", "0", FCVAR_ARCHIVE );
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 10c8c11..b7d4e94 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -38,7 +38,7 @@ file(GLOB MAINUI_MENUS_SOURCES "menus/*.cpp" "menus/dynamic/*.cpp" "menus/client
+ file(GLOB MAINUI_FONT_RENDER_SOURCES "font/*.cpp")
+ file(GLOB MAINUI_SOURCES "miniutl/*.cpp" "*.cpp")
+ 
+-add_library(menu SHARED ${MAINUI_CONTROLS_SOURCES} ${MAINUI_MENUS_SOURCES} ${MAINUI_FONT_RENDER_SOURCES} ${MAINUI_SOURCES} ${CMAKE_SOURCE_DIR}/common/interface.cpp)
++add_library(menu SHARED ${MAINUI_CONTROLS_SOURCES} ${MAINUI_MENUS_SOURCES} ${MAINUI_FONT_RENDER_SOURCES} ${MAINUI_SOURCES} ${CMAKE_SOURCE_DIR}/common/interface.cpp ${CMAKE_CURRENT_SOURCE_DIR}/access_tts.c)
+ 
+ if(NOT WIN32 AND NOT MINGW)
+ 	add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+diff --git a/access_tts.c b/access_tts.c
+new file mode 100644
+index 0000000..ce7f9a8
+--- /dev/null
++++ b/access_tts.c
+@@ -0,0 +1,148 @@
++/*
++access_tts.c - minimal screen reader output (NVDA controller client)
++*/
++
++#include "access_tts.h"
++
++#ifdef _WIN32
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++// Optional transcript: when ACCESS_TTS_LOG names a file, every utterance is
++// appended to it (used by the automated menu tests, and handy for debugging).
++static void LogUtterance( const char *utf8, int interrupt )
++{
++	static int checked;
++	static char path[MAX_PATH];
++	FILE *f;
++
++	if( !checked )
++	{
++		const char *env = getenv( "ACCESS_TTS_LOG" );
++		checked = 1;
++		if( env )
++			snprintf( path, sizeof( path ), "%s", env );
++	}
++	if( !path[0] )
++		return;
++	f = fopen( path, "ab" );
++	if( !f )
++		return;
++	// "! " interrupting speech, "  " queued speech, "# " diagnostic only
++	fprintf( f, "%s%s\n", interrupt == 2 ? "# " : ( interrupt ? "! " : "  " ), utf8 );
++	fclose( f );
++}
++
++typedef unsigned long ( __stdcall *nvdaSpeakText_t )( const wchar_t *text );
++typedef unsigned long ( __stdcall *nvdaCancelSpeech_t )( void );
++
++static int s_loadTried;
++static nvdaSpeakText_t s_pfnSpeakText;
++static nvdaCancelSpeech_t s_pfnCancelSpeech;
++
++static void LoadNvda( void )
++{
++	HMODULE self = NULL, lib = NULL;
++	wchar_t path[MAX_PATH];
++
++	if( s_loadTried )
++		return;
++	s_loadTried = 1;
++
++	// Next to the calling module first (cl_dlls\ for client and menu, engine dir for xash.dll).
++	if( GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++		(LPCWSTR)&LoadNvda, &self ) )
++	{
++		DWORD len = GetModuleFileNameW( self, path, MAX_PATH );
++		wchar_t *slash = len > 0 && len < MAX_PATH ? wcsrchr( path, L'\\' ) : NULL;
++		if( slash && ( slash - path ) + 32 < MAX_PATH )
++		{
++			wcscpy( slash + 1, L"nvdaControllerClient.dll" );
++			lib = LoadLibraryW( path );
++		}
++	}
++	if( !lib )
++		lib = LoadLibraryW( L"nvdaControllerClient.dll" );
++	if( !lib )
++		return;
++
++	s_pfnSpeakText = (nvdaSpeakText_t)GetProcAddress( lib, "nvdaController_speakText" );
++	s_pfnCancelSpeech = (nvdaCancelSpeech_t)GetProcAddress( lib, "nvdaController_cancelSpeech" );
++	if( !s_pfnSpeakText )
++		FreeLibrary( lib );
++}
++
++void AccessTts_Log( const char *utf8 )
++{
++	LogUtterance( utf8, 2 );
++}
++
++int AccessTts_Speak( const char *utf8, int interrupt )
++{
++	wchar_t wide[2048];
++	int n;
++
++	if( !utf8 || !utf8[0] )
++		return ACCESS_TTS_OK;
++
++	LogUtterance( utf8, interrupt );
++	LoadNvda();
++	if( !s_pfnSpeakText )
++		return ACCESS_TTS_UNAVAILABLE;
++
++	n = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, (int)( sizeof( wide ) / sizeof( wide[0] ) ) );
++	if( n == 0 )
++		n = MultiByteToWideChar( CP_ACP, 0, utf8, -1, wide, (int)( sizeof( wide ) / sizeof( wide[0] ) ) );
++	if( n == 0 )
++		return ACCESS_TTS_OK;	// too long or unconvertible: drop silently
++	wide[sizeof( wide ) / sizeof( wide[0] ) - 1] = 0;
++
++	if( interrupt && s_pfnCancelSpeech )
++		s_pfnCancelSpeech();
++
++	return s_pfnSpeakText( wide ) == 0 ? ACCESS_TTS_OK : ACCESS_TTS_NOT_RUNNING;
++}
++
++void AccessTts_Cancel( void )
++{
++	LoadNvda();
++	if( s_pfnCancelSpeech )
++		s_pfnCancelSpeech();
++}
++
++unsigned int AccessTts_Ticks( void )
++{
++	return (unsigned int)GetTickCount();
++}
++
++#else // !_WIN32
++
++void AccessTts_Log( const char *utf8 )
++{
++	(void)utf8;
++}
++
++#include <time.h>
++
++int AccessTts_Speak( const char *utf8, int interrupt )
++{
++	(void)utf8;
++	(void)interrupt;
++	return ACCESS_TTS_UNAVAILABLE;
++}
++
++void AccessTts_Cancel( void )
++{
++}
++
++unsigned int AccessTts_Ticks( void )
++{
++	struct timespec ts;
++	clock_gettime( CLOCK_MONOTONIC, &ts );
++	return (unsigned int)( ts.tv_sec * 1000u + ts.tv_nsec / 1000000u );
++}
++
++#endif
+diff --git a/access_tts.h b/access_tts.h
+new file mode 100644
+index 0000000..14ddaef
+--- /dev/null
++++ b/access_tts.h
+@@ -0,0 +1,36 @@
++/*
++access_tts.h - minimal screen reader output (NVDA controller client), shared by
++the client (client.dll), the menus (menu.dll) and the engine (xash.dll).
++
++Plain C and free of engine headers, so it can be dropped into any of the three
++code bases; nvdaControllerClient.dll is loaded at runtime from the module's own
++folder, then from the normal DLL search path.
++*/
++#ifndef ACCESS_TTS_H
++#define ACCESS_TTS_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum
++{
++	ACCESS_TTS_OK = 1,
++	ACCESS_TTS_NOT_RUNNING = 0,		// DLL loaded but NVDA did not accept the text
++	ACCESS_TTS_UNAVAILABLE = -1		// no nvdaControllerClient.dll / unsupported platform
++};
++
++// Speaks UTF-8 text (invalid UTF-8 falls back to the ANSI code page).
++// interrupt != 0 cancels whatever is being spoken first.
++int AccessTts_Speak( const char *utf8, int interrupt );
++void AccessTts_Cancel( void );
++// Millisecond tick counter (wraps; compare with signed differences).
++unsigned int AccessTts_Ticks( void );
++// Writes a diagnostic line to the ACCESS_TTS_LOG transcript only (never spoken).
++void AccessTts_Log( const char *utf8 );
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // ACCESS_TTS_H
+diff --git a/controls/DropDown.h b/controls/DropDown.h
+index 4901645..c3cc8f1 100644
+--- a/controls/DropDown.h
++++ b/controls/DropDown.h
+@@ -49,6 +49,11 @@ public:
+ 		return m_szNames.Count();
+ 	}
+ 
++	const char *GetCurrentName() const
++	{
++		return m_szNames.IsValidIndex( m_iState ) ? m_szNames[m_iState] : NULL;
++	}
++
+ 	void SelectItem( int i, bool event = true )
+ 	{
+ 		if( !m_szNames.IsValidIndex( i ))
+diff --git a/controls/Field.h b/controls/Field.h
+index b5e6c24..e9100f5 100644
+--- a/controls/Field.h
++++ b/controls/Field.h
+@@ -56,6 +56,7 @@ public:
+ 		SetCvarString( szBuffer );
+ 	}
+ 
++	int GetCursorPos() const { return iCursor; }
+ 	const char *GetBuffer()
+ 	{
+ 		return szBuffer;
+diff --git a/controls/MessageBox.h b/controls/MessageBox.h
+index 02aeaef..8c20c28 100644
+--- a/controls/MessageBox.h
++++ b/controls/MessageBox.h
+@@ -26,6 +26,7 @@ public:
+ 	CMenuMessageBox( const char *name = "Unnamed MessageBox" );
+ 
+ 	void SetMessage( const char *sz );
++	const char *GetMessage() const { return dlgMessage.szName; }
+ private:
+ 	void _Init() override;
+ 	void Draw() override;
+diff --git a/controls/Slider.h b/controls/Slider.h
+index 23fb0a9..89c9dd1 100644
+--- a/controls/Slider.h
++++ b/controls/Slider.h
+@@ -49,6 +49,8 @@ public:
+ 	}
+ 
+ 	float GetCurrentValue() { return m_flCurValue; }
++	float GetMinValue() const { return m_flMinValue; }
++	float GetMaxValue() const { return m_flMaxValue; }
+ 	// void SetDrawStep( float drawStep, int numSteps );
+ 
+ 	void SetKeepSlider( int keepSlider ) { m_iKeepSlider = keepSlider; }
+diff --git a/controls/SpinControl.h b/controls/SpinControl.h
+index 1829837..50a8c9d 100644
+--- a/controls/SpinControl.h
++++ b/controls/SpinControl.h
+@@ -42,6 +42,7 @@ public:
+ 	void SetCurrentValue( float curValue );
+ 
+ 	float GetCurrentValue( ) { return m_flCurValue; }
++	const char *GetDisplayText( ) const { return m_szDisplay; }
+ 	const char *GetCurrentString( ) { return m_pModel ? m_pModel->GetText( (int)m_flCurValue ) : NULL; }
+ 
+ 	void ForceDisplayString( const char *display );
+diff --git a/controls/Switch.cpp b/controls/Switch.cpp
+index e3e0063..197fa8e 100644
+--- a/controls/Switch.cpp
++++ b/controls/Switch.cpp
+@@ -138,6 +138,18 @@ void CMenuSwitch::VidInit()
+ 	m_scTextSize.h = m_scChSize;
+ }
+ 
++int CMenuSwitch::NextVisibleState() const
++{
++	const int count = m_switches.Count();
++	for( int step = 1; step <= count; step++ )
++	{
++		const int i = ( m_iState + step ) % count;
++		if( !m_switches[i].hidden )
++			return i;
++	}
++	return m_iState;
++}
++
+ bool CMenuSwitch::KeyUp( int key )
+ {
+ 	const char *sound = NULL;
+@@ -152,8 +164,14 @@ bool CMenuSwitch::KeyUp( int key )
+ 			sound = uiStatic.sounds[SND_GLOW];
+ 	}
+ 	else if( UI::Key::IsEnter( key ) && !FBitSet( iFlags, QMF_MOUSEONLY ))
++	{
+ 		sound = uiStatic.sounds[SND_GLOW];
+ 
++		// Keyboard (and screen reader) users cycle through the visible states with Enter.
++		state = NextVisibleState();
++		haveNewState = state != m_iState;
++	}
++
+ 	if( sound )
+ 	{
+ 		_Event( QM_RELEASED );
+@@ -183,8 +201,14 @@ bool CMenuSwitch::KeyDown( int key )
+ 			sound = uiStatic.sounds[SND_GLOW];
+ 	}
+ 	else if( UI::Key::IsEnter( key ) && !FBitSet( iFlags, QMF_MOUSEONLY ))
++	{
+ 		sound = uiStatic.sounds[SND_GLOW];
+ 
++		// Keyboard (and screen reader) users cycle through the visible states with Enter.
++		state = NextVisibleState();
++		haveNewState = state != m_iState;
++	}
++
+ 	if( sound )
+ 	{
+ 		_Event( QM_PRESSED );
+diff --git a/controls/Switch.h b/controls/Switch.h
+index ed6df12..25ed02e 100644
+--- a/controls/Switch.h
++++ b/controls/Switch.h
+@@ -41,6 +41,9 @@ public:
+ 	void AddSwitch( const char *text, bool hidden = false );
+ 
+ 	int GetState() { return m_iState; }
++	int GetSwitchCount() const { return m_switches.Count(); }
++	int NextVisibleState() const;
++	const char *GetSwitchName( int i ) const { return m_switches.IsValidIndex( i ) ? m_switches[i].name : NULL; }
+ 	void SetState( int state );
+ 
+ 	bool bMouseToggle;
+diff --git a/controls/Table.h b/controls/Table.h
+index e38f09d..2b388ce 100644
+--- a/controls/Table.h
++++ b/controls/Table.h
+@@ -58,6 +58,8 @@ public:
+ 	bool MoveView( int delta );
+ 	bool MoveCursor( int delta );
+ 	int GetCurrentIndex() { return iCurItem; }
++	CMenuBaseModel *GetModel() const { return m_pModel; }
++	const char *GetHeaderText( int num ) const { return num >= 0 && num < MAX_TABLE_COLUMNS ? szHeaderTexts[num] : NULL; }
+ 	void SetCurrentIndex( int idx );
+ 	int GetSortingColumn( void ) { return m_iSortingColumn; }
+ 	bool IsAscend( void ) { return m_bAscend; }
+diff --git a/menu_access.cpp b/menu_access.cpp
+new file mode 100644
+index 0000000..fcece10
+--- /dev/null
++++ b/menu_access.cpp
+@@ -0,0 +1,687 @@
++/*
++menu_access.cpp - screen reader support for every menu window (NVDA)
++
++Instead of instrumenting each control, the active window is observed once per
++frame: which window is on top, which item holds the keyboard cursor (descending
++into nested holders such as tab views and script pages), and a text description
++of that item. Any change is spoken:
++
++  new window      -> title (or dialog message) + focused item, interrupting
++  focus moved     -> full description of the new item ("Audio, bouton")
++  value changed   -> only the new value ("cochée", "40 pour cent", table row)
++  text field edit -> typed / deleted characters, character under the cursor
++
++Because it reads state rather than events, it also covers mouse changes and
++windows that update themselves (connection progress).
++*/
++
++#include "BaseMenu.h"
++#include "ItemsHolder.h"
++#include "BaseWindow.h"
++#include "Framework.h"
++#include "Action.h"
++#include "PicButton.h"
++#include "CheckBox.h"
++#include "Slider.h"
++#include "SpinControl.h"
++#include "Field.h"
++#include "Switch.h"
++#include "DropDown.h"
++#include "Table.h"
++#include "MessageBox.h"
++#include "YesNoMessageBox.h"
++
++#include "menu_access.h"
++#include "access_tts.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <typeinfo>
++
++static const size_t DESC_SIZE = 1024;
++
++static CMenuBaseWindow *s_pLastWindow;
++static CMenuBaseItem *s_pLastItem;
++static char s_szLastValue[DESC_SIZE];
++static char s_szLastField[DESC_SIZE];
++static int s_iLastFieldCursor;
++static char s_szLastStaticText[DESC_SIZE];
++static bool s_bToldHowToNavigate;
++static CMenuBaseWindow *s_pSettlingWindow;
++static unsigned int s_uSettleStart;
++static CMenuBaseItem *s_pCandidateItem;
++static int s_iLastCursor = -1;
++static unsigned int s_uCandidateStart;
++
++// ---------------------------------------------------------------------------
++// Text helpers
++// ---------------------------------------------------------------------------
++
++// Appends src to dst, dropping ^N colour codes and control characters.
++static void Append( char *dst, size_t size, const char *src )
++{
++	if( !src )
++		return;
++	size_t o = strlen( dst );
++	for( const char *p = src; *p && o + 1 < size; p++ )
++	{
++		if( *p == '^' && p[1] >= '0' && p[1] <= '9' )
++		{
++			p++;
++			continue;
++		}
++		if( (unsigned char)*p < 0x20 )
++		{
++			if( o > 0 && dst[o - 1] != ' ' )
++				dst[o++] = ' ';
++			continue;
++		}
++		dst[o++] = *p;
++	}
++	dst[o] = 0;
++}
++
++static void AppendSep( char *dst, size_t size, const char *src )
++{
++	if( !src || !src[0] )
++		return;
++	if( dst[0] )
++		Append( dst, size, ", " );
++	Append( dst, size, src );
++}
++
++// Appends a sentence, separated by ". ", skipping empty or blank text.
++static void AppendSentence( char *dst, size_t size, const char *src )
++{
++	if( !src )
++		return;
++	while( *src == ' ' || *src == '.' )
++		src++;
++	if( !src[0] )
++		return;
++	if( dst[0] )
++	{
++		const size_t len = strlen( dst );
++		Append( dst, size, strchr( ".?!:", dst[len - 1] ) ? " " : ". " );
++	}
++	Append( dst, size, src );
++}
++
++static void Speak( const char *text, bool interrupt )
++{
++	if( text && text[0] )
++		AccessTts_Speak( text, interrupt ? 1 : 0 );
++}
++
++// Spoken form of one UTF-8 character.
++static void DescribeChar( const char *utf8, int len, bool hidden, char *out, size_t size )
++{
++	if( hidden )
++		snprintf( out, size, "étoile" );
++	else if( len == 1 && utf8[0] == ' ' )
++		snprintf( out, size, "espace" );
++	else
++		snprintf( out, size, "%.*s", len, utf8 );
++}
++
++static int Utf8Len( const char *p )
++{
++	const unsigned char c = (unsigned char)*p;
++	if( c < 0x80 ) return 1;
++	if( ( c & 0xE0 ) == 0xC0 ) return 2;
++	if( ( c & 0xF0 ) == 0xE0 ) return 3;
++	if( ( c & 0xF8 ) == 0xF0 ) return 4;
++	return 1;
++}
++
++// ---------------------------------------------------------------------------
++// Window titles
++// ---------------------------------------------------------------------------
++
++static const char *KnownTitle( const char *className )
++{
++	static const struct { const char *name; const char *title; } titles[] =
++	{
++		{ "CMenuMain", "Menu principal" },
++		{ "CMenuNewGame", "Nouvelle partie" },
++		{ "CMenuMultiplayer", "Multijoueur" },
++		{ "CMenuServerBrowser", "Liste des serveurs" },
++		{ "CMenuServerInfo", "Informations du serveur" },
++		{ "CMenuCreateGame", "Créer une partie" },
++		{ "CMenuCustomGame", "Choix du mod" },
++		{ "CMenuLoadGame", "Charger une partie" },
++		{ "CMenuSaveLoad", "Sauvegarder et charger" },
++		{ "CMenuOptions", "Options" },
++		{ "CMenuAudio", "Options audio" },
++		{ "CMenuVideo", "Options vidéo" },
++		{ "CMenuVidOptions", "Réglages de l'image" },
++		{ "CMenuVidModes", "Résolution et mode d'affichage" },
++		{ "CMenuControls", "Touches du clavier" },
++		{ "CAdvancedControls", "Commandes avancées, souris" },
++		{ "CMenuGameOptions", "Options de jeu" },
++		{ "CMenuPlayerSetup", "Personnalisation du joueur" },
++		{ "CMenuCrosshair", "Réglage du viseur" },
++		{ "CMenuInputDevices", "Périphériques d'entrée" },
++		{ "CMenuGamePad", "Manette" },
++		{ "CMenuGyro", "Gyroscope" },
++		{ "CMenuTouchButtons", "Boutons tactiles" },
++		{ "CMenuTouchEdit", "Édition tactile" },
++		{ "CMenuTouchOptions", "Options tactiles" },
++		{ "CMenuFileDialog", "Choix d'un fichier" },
++		{ "ScriptConfig", "Options du serveur" },
++		{ "CClientJoinGame", "Choix de l'équipe" },
++		{ "CClientJoinClass", "Choix du personnage" },
++		{ "CMenuColorPickerDialog", "Choix de couleur" },
++		{ "CMenuCommandPickerDialog", "Choix d'une commande" },
++		{ "ConnectionProgress", "Connexion" },
++		{ "ConnectionWarning", "Avertissement de connexion" },
++		{ "Credits", "Crédits" },
++	};
++	if( !className )
++		return NULL;
++	for( size_t i = 0; i < sizeof( titles ) / sizeof( titles[0] ); i++ )
++		if( !strcmp( className, titles[i].name ) )
++			return titles[i].title;
++	return NULL;
++}
++
++// Title for a window: dialogs speak their message, menus a known title, then the
++// banner text (label of the button that opened it), then the internal name.
++static void WindowTitle( CMenuBaseWindow *win, char *out, size_t size )
++{
++	out[0] = 0;
++	if( CMenuYesNoMessageBox *yn = dynamic_cast<CMenuYesNoMessageBox *>( win ))
++	{
++		Append( out, size, "Question : " );
++		Append( out, size, yn->dlgMessage1.szName );
++		return;
++	}
++	if( CMenuMessageBox *mb = dynamic_cast<CMenuMessageBox *>( win ))
++	{
++		Append( out, size, "Message : " );
++		Append( out, size, mb->GetMessage() );
++		return;
++	}
++
++	const char *known = KnownTitle( win->szName );
++	if( known )
++	{
++		Append( out, size, known );
++		if( !strcmp( win->szName, "CMenuMain" ) && EngFuncs::ClientInGame() )
++			Append( out, size, ", partie en cours" );
++		return;
++	}
++	CMenuFramework *fw = dynamic_cast<CMenuFramework *>( win );
++	if( fw && fw->banner.szName && fw->banner.szName[0] )
++		Append( out, size, fw->banner.szName );
++	else
++		Append( out, size, win->szName );
++}
++
++// ---------------------------------------------------------------------------
++// Items
++// ---------------------------------------------------------------------------
++
++static bool IsFocusable( CMenuBaseItem *item )
++{
++	return item && item->IsVisible() && !( item->iFlags & ( QMF_INACTIVE | QMF_MOUSEONLY ));
++}
++
++// Worth announcing: a labelled item or an input control. Banners and pictures
++// are keyboard-reachable in mainui but carry nothing a listener can use.
++static bool IsMeaningful( CMenuBaseItem *item )
++{
++	if( !IsFocusable( item ))
++		return false;
++	// The title banner repeats the window name, which the title already says.
++	if( dynamic_cast<CMenuFramework::CMenuBannerBitmap *>( item ))
++		return false;
++	if( item->szName && item->szName[0] )
++		return true;
++	return dynamic_cast<CMenuEditable *>( item ) || dynamic_cast<CMenuTable *>( item ) || dynamic_cast<CMenuItemsHolder *>( item );
++}
++
++// The item that really has the keyboard cursor, descending into nested holders.
++static CMenuBaseItem *FocusedLeaf( CMenuItemsHolder *holder )
++{
++	CMenuBaseItem *item = holder->ItemAtCursor();
++	for( int depth = 0; item && depth < 8; depth++ )
++	{
++		CMenuItemsHolder *inner = dynamic_cast<CMenuItemsHolder *>( item );
++		if( !inner || inner->IsWindow() )
++			break;
++		CMenuBaseItem *next = inner->ItemAtCursor();
++		if( !next )
++			break;
++		item = next;
++	}
++	return item;
++}
++
++// The arrows stopped on a decoration: continue in the same direction to the
++// next meaningful item (wrapping), as if the decoration were not there.
++static void SkipDecoration( CMenuBaseWindow *win, int previousCursor )
++{
++	const int count = win->ItemCount();
++	const int cursor = win->GetCursor();
++	if( count <= 0 || cursor < 0 )
++		return;
++	// The arrows move one step at a time, skipping hidden and mouse-only items, so a
++	// jump of more than half the list means the cursor wrapped around the end.
++	int dir = cursor > previousCursor ? 1 : -1;
++	if( previousCursor >= 0 && ( cursor - previousCursor > count / 2 || previousCursor - cursor > count / 2 ))
++		dir = -dir;
++	for( int step = 1; step < count; step++ )
++	{
++		const int i = ( ( cursor + dir * step ) % count + count ) % count;
++		if( IsMeaningful( win->GetItemByIndex( i )))
++		{
++			win->SetCursor( i );
++			return;
++		}
++	}
++}
++
++static void DescribeTableRow( CMenuTable *table, char *out, size_t size )
++{
++	CMenuBaseModel *model = table->GetModel();
++	const int rows = model ? model->GetRows() : 0;
++	if( rows <= 0 )
++	{
++		Append( out, size, "vide" );
++		return;
++	}
++	const int row = table->GetCurrentIndex();
++	if( row < 0 || row >= rows )
++	{
++		char buf[64];
++		snprintf( buf, sizeof( buf ), "%d lignes, aucune sélectionnée", rows );
++		Append( out, size, buf );
++		return;
++	}
++
++	char pos[64];
++	snprintf( pos, sizeof( pos ), "ligne %d sur %d", row + 1, rows );
++	Append( out, size, pos );
++	for( int col = 0; col < model->GetColumns(); col++ )
++	{
++		const char *cell = model->GetCellText( row, col );
++		if( !cell || !cell[0] )
++			continue;
++		// Rows made only of '=' are section separators in the key binding list.
++		if( strspn( cell, "=-_ " ) == strlen( cell ))
++		{
++			Append( out, size, ", séparateur de section" );
++			continue;
++		}
++		Append( out, size, ", " );
++		const char *header = table->GetHeaderText( col );
++		if( header && header[0] )
++		{
++			Append( out, size, header );
++			Append( out, size, " " );
++		}
++		Append( out, size, cell );
++	}
++}
++
++// value: only the part that changes when the user operates the control.
++// kind: spoken control type ("bouton", "case à cocher"...).
++static void DescribeItem( CMenuBaseItem *item, char *kind, char *value )
++{
++	kind[0] = value[0] = 0;
++	if( !item )
++		return;
++
++	if( CMenuCheckBox *cb = dynamic_cast<CMenuCheckBox *>( item ))
++	{
++		strcpy( kind, "case à cocher" );
++		Append( value, DESC_SIZE, cb->bChecked ? "cochée" : "non cochée" );
++	}
++	else if( CMenuSlider *sl = dynamic_cast<CMenuSlider *>( item ))
++	{
++		strcpy( kind, "curseur" );
++		const float range = sl->GetMaxValue() - sl->GetMinValue();
++		const int percent = range > 0.0f ? (int)( ( sl->GetCurrentValue() - sl->GetMinValue() ) / range * 100.0f + 0.5f ) : 0;
++		snprintf( value, DESC_SIZE, "%d pour cent", percent );
++	}
++	else if( CMenuSpinControl *sp = dynamic_cast<CMenuSpinControl *>( item ))
++	{
++		strcpy( kind, "sélecteur, flèches gauche et droite" );
++		Append( value, DESC_SIZE, sp->GetDisplayText() );
++	}
++	else if( CMenuField *f = dynamic_cast<CMenuField *>( item ))
++	{
++		strcpy( kind, "zone de texte" );
++		const char *buf = f->GetBuffer();
++		if( !buf || !buf[0] )
++			Append( value, DESC_SIZE, "vide" );
++		else if( f->bHideInput )
++			snprintf( value, DESC_SIZE, "%d caractères masqués", (int)strlen( buf ));
++		else
++			Append( value, DESC_SIZE, buf );
++	}
++	else if( CMenuDropDown *dd = dynamic_cast<CMenuDropDown *>( item ))
++	{
++		strcpy( kind, "liste déroulante, flèches haut et bas" );
++		Append( value, DESC_SIZE, dd->GetCurrentName() );
++	}
++	else if( CMenuSwitch *sw = dynamic_cast<CMenuSwitch *>( item ))
++	{
++		strcpy( kind, "onglets, Entrée pour changer" );
++		Append( value, DESC_SIZE, sw->GetSwitchName( sw->GetState() ));
++	}
++	else if( CMenuTable *tb = dynamic_cast<CMenuTable *>( item ))
++	{
++		strcpy( kind, "liste, flèches haut et bas, Entrée pour choisir" );
++		DescribeTableRow( tb, value, DESC_SIZE );
++	}
++	else if( dynamic_cast<CMenuPicButton *>( item ))
++	{
++		strcpy( kind, "bouton" );
++	}
++}
++
++// Name to speak for an item. Unnamed controls (filter drop-downs, fields in some
++// dialogs) are laid out as "label, control": use the nearest static text before it.
++static const char *SpokenName( CMenuBaseItem *item )
++{
++	if( item->szName && item->szName[0] )
++		return item->szName;
++
++	CMenuItemsHolder *parent = item->Parent();
++	if( !parent )
++		return NULL;
++
++	int index = -1;
++	for( int i = 0; i < parent->ItemCount(); i++ )
++	{
++		if( parent->GetItemByIndex( i ) == item )
++		{
++			index = i;
++			break;
++		}
++	}
++	for( int i = index - 1; i >= 0; i-- )
++	{
++		CMenuBaseItem *prev = parent->GetItemByIndex( i );
++		if( !prev || !prev->IsVisible() )
++			continue;
++		if( dynamic_cast<CMenuAction *>( prev ))
++			return prev->szName && prev->szName[0] ? prev->szName : NULL;
++		if( IsMeaningful( prev ))
++			break;	// another control comes first: the label is not ours
++	}
++	return NULL;
++}
++
++static void FullDescription( CMenuBaseItem *item, char *out, size_t size )
++{
++	char kind[128], value[DESC_SIZE];
++	DescribeItem( item, kind, value );
++
++	Append( out, size, SpokenName( item ));
++	AppendSep( out, size, kind );
++	AppendSep( out, size, value );
++	if( item->iFlags & QMF_GRAYED )
++		AppendSep( out, size, "indisponible" );
++	if( item->szStatusText && item->szStatusText[0] && ( !item->szName || strcmp( item->szName, item->szStatusText )))
++	{
++		Append( out, size, ". " );
++		Append( out, size, item->szStatusText );
++	}
++}
++
++// Visible static texts of a window (dialog bodies, connection progress...).
++static void StaticTexts( CMenuItemsHolder *win, char *out, size_t size )
++{
++	out[0] = 0;
++	for( int i = 0; i < win->ItemCount(); i++ )
++	{
++		CMenuBaseItem *item = win->GetItemByIndex( i );
++		if( !item || !item->IsVisible() || !dynamic_cast<CMenuAction *>( item ))
++			continue;
++		if( item->szName && item->szName[0] )
++		{
++			if( out[0] )
++				Append( out, size, ". " );
++			Append( out, size, item->szName );
++		}
++	}
++}
++
++// Text field editing: say what was typed or deleted, or the character reached.
++static void AnnounceFieldEdit( CMenuField *field )
++{
++	const char *now = field->GetBuffer() ? field->GetBuffer() : "";
++	const int cursor = field->GetCursorPos();
++	const char *before = s_szLastField;
++	const size_t lenNow = strlen( now ), lenBefore = strlen( before );
++	char spoken[256] = "";
++
++	if( strcmp( now, before ))
++	{
++		size_t prefix = 0;
++		while( prefix < lenNow && prefix < lenBefore && now[prefix] == before[prefix] )
++			prefix++;
++		size_t suffix = 0;
++		while( suffix < lenNow - prefix && suffix < lenBefore - prefix && now[lenNow - 1 - suffix] == before[lenBefore - 1 - suffix] )
++			suffix++;
++
++		const int added = (int)( lenNow - prefix - suffix );
++		const int removed = (int)( lenBefore - prefix - suffix );
++		if( added > 0 && removed == 0 )
++		{
++			if( added <= 4 )
++				DescribeChar( now + prefix, added, field->bHideInput, spoken, sizeof( spoken ));
++			else if( !field->bHideInput )
++				snprintf( spoken, sizeof( spoken ), "%.*s", added, now + prefix );
++		}
++		else if( removed > 0 && added == 0 )
++		{
++			char ch[64];
++			DescribeChar( before + prefix, removed, field->bHideInput, ch, sizeof( ch ));
++			snprintf( spoken, sizeof( spoken ), "%s effacé", ch );
++		}
++		else
++		{
++			// Replaced wholesale (history, paste, completion).
++			snprintf( spoken, sizeof( spoken ), "%s", field->bHideInput ? "texte masqué" : ( lenNow ? now : "vide" ));
++		}
++	}
++	else if( cursor != s_iLastFieldCursor )
++	{
++		if( cursor >= 0 && (size_t)cursor < lenNow )
++			DescribeChar( now + cursor, Utf8Len( now + cursor ), field->bHideInput, spoken, sizeof( spoken ));
++		else
++			snprintf( spoken, sizeof( spoken ), "fin" );
++	}
++
++	Speak( spoken, true );
++	snprintf( s_szLastField, sizeof( s_szLastField ), "%s", now );
++	s_iLastFieldCursor = cursor;
++}
++
++static void RememberField( CMenuBaseItem *item )
++{
++	CMenuField *field = dynamic_cast<CMenuField *>( item );
++	snprintf( s_szLastField, sizeof( s_szLastField ), "%s", field && field->GetBuffer() ? field->GetBuffer() : "" );
++	s_iLastFieldCursor = field ? field->GetCursorPos() : 0;
++}
++
++// ---------------------------------------------------------------------------
++// Frame
++// ---------------------------------------------------------------------------
++
++static cvar_t *access_menu_mouse;
++
++void MenuAccess_Init( void )
++{
++	access_menu_mouse = EngFuncs::CvarRegister( "access_menu_mouse", "0", FCVAR_ARCHIVE );
++}
++
++bool MenuAccess_MouseEnabled( void )
++{
++	return access_menu_mouse && access_menu_mouse->value != 0.0f;
++}
++
++void MenuAccess_ParkPointer( void )
++{
++	// Keyboard-only mode: park the menu's pointer off screen, so windows that
++	// re-test the pointer when they open or regain focus never move the focus.
++	if( !MenuAccess_MouseEnabled( ))
++	{
++		uiStatic.cursorX = -10000;
++		uiStatic.cursorY = -10000;
++	}
++}
++
++void MenuAccess_Frame( void )
++{
++	MenuAccess_ParkPointer();
++
++	CMenuBaseWindow *win = NULL;
++	if( uiStatic.menu.IsActive() )
++		win = uiStatic.menu.Current();
++	else if( uiStatic.client.IsActive() )
++		win = uiStatic.client.Current();
++
++	if( !win )
++	{
++		// Menus closed: the next open window is announced again.
++		s_pLastWindow = NULL;
++		s_pLastItem = NULL;
++		return;
++	}
++
++	static CMenuBaseWindow *s_pLoggedWindow;
++	if( win != s_pLoggedWindow )
++	{
++		char diag[160];
++		snprintf( diag, sizeof( diag ), "fenêtre %s, %d éléments, curseur %d", win->szName, win->ItemCount(), win->GetCursor() );
++		AccessTts_Log( diag );
++		for( int i = 0; i < win->ItemCount(); i++ )
++		{
++			CMenuBaseItem *it = win->GetItemByIndex( i );
++			if( !it )
++				continue;
++			snprintf( diag, sizeof( diag ), "  [%d] %s flags=%08x visible=%d '%s'", i, typeid( *it ).name(), it->iFlags,
++				it->IsVisible() ? 1 : 0, it->szName ? it->szName : "" );
++			AccessTts_Log( diag );
++		}
++		s_pLoggedWindow = win;
++	}
++
++	const bool windowChanged = win != s_pLastWindow;
++	const unsigned int now = AccessTts_Ticks();
++
++	CMenuBaseItem *item = FocusedLeaf( win );
++	if( item && !IsMeaningful( item ))
++	{
++		// The arrows stopped on a banner or picture: carry on to the next
++		// meaningful item. Never done when a window opens, because the key that
++		// opened it is still being released and buttons activate on release.
++		if( !windowChanged && win->GetCursor() != s_iLastCursor && IsFocusable( win->ItemAtCursor() ))
++		{
++			SkipDecoration( win, s_iLastCursor );
++			item = FocusedLeaf( win );
++			if( item && !IsMeaningful( item ))
++				item = NULL;
++		}
++		else
++			item = NULL;
++	}
++
++	// Let the opening animation settle (items turn visible/active) briefly, so
++	// the title is spoken together with the focused item when there is one.
++	if( windowChanged && !item )
++	{
++		if( s_pSettlingWindow != win )
++		{
++			s_pSettlingWindow = win;
++			s_uSettleStart = now;
++		}
++		if( (int)( now - s_uSettleStart ) < 400 )
++			return;
++	}
++	s_pSettlingWindow = NULL;
++
++	// Focus changes are spoken once stable for 80 ms, so transient flicker
++	// (animations) never reaches the speech output.
++	if( !windowChanged && item && item != s_pLastItem )
++	{
++		if( item != s_pCandidateItem )
++		{
++			s_pCandidateItem = item;
++			s_uCandidateStart = now;
++			return;
++		}
++		if( (int)( now - s_uCandidateStart ) < 80 )
++			return;
++	}
++	s_pCandidateItem = NULL;
++
++	char kind[128], value[DESC_SIZE];
++	DescribeItem( item, kind, value );
++
++	char text[DESC_SIZE * 2];
++	text[0] = 0;
++
++	char statics[DESC_SIZE];
++	StaticTexts( win, statics, sizeof( statics ));
++
++	if( windowChanged )
++	{
++		WindowTitle( win, text, sizeof( text ));
++
++		if( item )
++		{
++			char desc[DESC_SIZE] = "";
++			FullDescription( item, desc, sizeof( desc ));
++			AppendSentence( text, sizeof( text ), desc );
++		}
++		else if( !dynamic_cast<CMenuYesNoMessageBox *>( win ) && !dynamic_cast<CMenuMessageBox *>( win ))
++		{
++			AppendSentence( text, sizeof( text ), statics );
++		}
++
++		if( !s_bToldHowToNavigate )
++		{
++			AppendSentence( text, sizeof( text ), "Flèches pour naviguer, Entrée pour valider, Échap pour revenir." );
++			s_bToldHowToNavigate = true;
++		}
++		Speak( text, true );
++		RememberField( item );
++	}
++	else if( !item )
++	{
++		// Nothing focused (cursor on a decoration). Windows without any focus
++		// that update themselves (connection progress) speak their text changes.
++		if( !s_pLastItem && strcmp( statics, s_szLastStaticText ))
++			Speak( statics, false );
++		snprintf( s_szLastStaticText, sizeof( s_szLastStaticText ), "%s", statics );
++		s_pLastWindow = win;
++		s_iLastCursor = win->GetCursor();
++		return;
++	}
++	else if( item != s_pLastItem )
++	{
++		FullDescription( item, text, sizeof( text ));
++		Speak( text, true );
++		RememberField( item );
++	}
++	else if( CMenuField *field = dynamic_cast<CMenuField *>( item ))
++	{
++		AnnounceFieldEdit( field );
++	}
++	else if( strcmp( value, s_szLastValue ))
++	{
++		Speak( value, true );
++	}
++
++	snprintf( s_szLastStaticText, sizeof( s_szLastStaticText ), "%s", statics );
++	s_pLastWindow = win;
++	s_pLastItem = item;
++	s_iLastCursor = win->GetCursor();
++	snprintf( s_szLastValue, sizeof( s_szLastValue ), "%s", value );
++}
+diff --git a/menu_access.h b/menu_access.h
+new file mode 100644
+index 0000000..d3df0c9
+--- /dev/null
++++ b/menu_access.h
+@@ -0,0 +1,13 @@
++/*
++menu_access.h - screen reader support for every menu window (NVDA)
++*/
++#pragma once
++
++// Call once per frame: announces window changes, focus moves and value changes.
++void MenuAccess_Frame( void );
++// Registers the menu accessibility cvars.
++void MenuAccess_Init( void );
++// False while access_menu_mouse is 0: mouse hovering must not move the focus.
++bool MenuAccess_MouseEnabled( void );
++// Moves the menu pointer off screen when the mouse is disabled (see access_menu_mouse).
++void MenuAccess_ParkPointer( void );
+diff --git a/menus/ServerBrowser.cpp b/menus/ServerBrowser.cpp
+index f7644af..fa34d17 100644
+--- a/menus/ServerBrowser.cpp
++++ b/menus/ServerBrowser.cpp
+@@ -1261,6 +1261,13 @@ void CMenuServerBrowser::_Init( void )
+ 	addServerBox.AddItem( serverProtocol );
+ 	addServerBox.AddItem( addressField );
+ 
++	// The filters have no visible caption (they sit under the list); name them for
++	// screen readers. Drop-downs do not draw szName, so the layout is unchanged.
++	filterPing.szName = L( "Maximum ping" );
++	filterEmpty.szName = L( "Empty servers" );
++	filterFull.szName = L( "Full servers" );
++	filterMap.szName = L( "Map filter" );
++
+ 	filterPing.AddItem( "500ms", 500.0f );
+ 	filterPing.AddItem( "200ms", 200.0f );
+ 	filterPing.AddItem( "100ms", 100.0f );

@@ -1,0 +1,35 @@
+# Whitelist: only project files are published. Game data (Valve), decompiled code, third-party
+# sources and binaries, build outputs and local test folders stay out.
+/*
+!/.gitignore
+!/README.md
+!/docs/
+!/patches/
+!/distribution/
+!/analysis/
+/analysis/*
+!/analysis/sons/
+!/analysis/client_exports_map.md
+!/tools/
+/tools/*
+!/tools/msvc_x86_env.bat
+!/tools/scripts/
+/tools/scripts/*
+!/tools/scripts/setup_sources.ps1
+!/tools/scripts/build_xash.bat
+!/tools/scripts/build_velaron.bat
+!/tools/scripts/assemble_game.ps1
+!/tools/scripts/menu_test.ps1
+!/tools/scripts/ExportDecompiled.java
+!/tools/scripts/run_decompile.sh
+!/tools/tests/
+!/tools/navtools/
+/tools/navtools/*
+!/tools/navtools/test_access_map.cpp
+!/tools/navtools/build_test.bat
+!/tools/navtools/navparse.py
+!/tools/navtools/bspents.py
+!/tools/audiotest/
+/tools/audiotest/*
+!/tools/audiotest/test_access_audio.cpp
+!/tools/audiotest/build.bat
