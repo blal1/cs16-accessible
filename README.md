@@ -42,7 +42,7 @@ Prérequis et détails : [docs/02-installation-depuis-zero.md](docs/02-installat
 
 | Document | Contenu |
 |---|---|
-| [01 — Guide du joueur](docs/01-guide-du-joueur.md) | menus, touches, les 19 sons, console, chat, réglages |
+| [01 — Guide du joueur](docs/01-guide-du-joueur.md) | menus, touches, les 26 sons, console, chat, réglages |
 | [02 — Installation depuis zéro](docs/02-installation-depuis-zero.md) | prérequis, versions, compilation, assemblage |
 | [03 — Architecture](docs/03-architecture.md) | comment moteur, menus et jeu parlent à NVDA |
 | [04 — Étendre et personnaliser](docs/04-etendre-et-personnaliser.md) | ajouter un son, une annonce, une touche, une traduction |
@@ -61,7 +61,7 @@ tools/scripts/   téléchargement des sources, compilation, assemblage, tests, d
 tools/tests/     configurations de test (bots, visée, grenades)
 tools/navtools/  test des cartes et du guidage + analyseurs Python .nav / .bsp
 tools/audiotest/ test du moteur de sons
-analysis/sons/   les 19 sons au format WAV, pour les apprendre
+analysis/sons/   les 26 sons au format WAV, pour les apprendre
 ```
 
 ## État et limites connues

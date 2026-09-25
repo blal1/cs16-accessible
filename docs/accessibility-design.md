@@ -125,7 +125,7 @@ CS16_Xash/                 playable game (Xash3D FWGS + CS 1.6 assets from the o
       access_tts.*       NVDA controller client, loaded at runtime (shared by all three layers)
       access_speech.*    HUD / chat / menus / kills speech, access_status, profile + language reload
       access_screens.*   scoreboard, timer, MOTD, hints, aim status bar, spectator, intermission
-      access_audio.*     XAudio2 on its own COM thread; 19 synthesized cues; pan / low-pass / pitch
+      access_audio.*     XAudio2 on its own COM thread; 26 synthesized cues; pan / low-pass / pitch
       access_map.*       BSP objectives + .nav mesh + A* with portal waypoints
       access_nav.*       sonar, ledges, scan, guidance, players, aim, grenades, damage, body
   cstrike/cl_dlls/menu.dll     built from repos/cs16-client/3rdparty/mainui_cpp (branch accessibility-nvda)

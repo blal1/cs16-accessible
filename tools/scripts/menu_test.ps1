@@ -1,5 +1,6 @@
 # Launches Xash3D (menu or map), posts key presses straight to its window, and prints the
-# speech transcript (ACCESS_TTS_LOG). Keys: Up Down Left Right Enter Esc Tab Space Back, a-z, 0-9.
+# speech transcript (ACCESS_TTS_LOG). Keys: Up Down Left Right Enter Esc Tab Space Back Home End Ins
+# Del PgUp PgDn F1-F12, a-z, 0-9; letters are sent by US QWERTY position, as the game names them.
 param(
     [string]$KeyList = 'Down Down Enter Esc',
     [int]$StartupSeconds = 15,
@@ -27,11 +28,23 @@ public static class K {
         System.Threading.Thread.Sleep(holdMs);
         PostMessage(h, 0x0101, (IntPtr)vk, (IntPtr)(1 | (sc << 16) | ext | (1u << 30) | (1u << 31)));
     }
+    // By physical position (scan code): the game names keys by their US QWERTY
+    // position, so "w" is the move-forward key on any keyboard layout.
+    public static void PressScan(IntPtr h, uint sc, int holdMs) {
+        uint vk = MapVirtualKey(sc, 1);
+        PostMessage(h, 0x0100, (IntPtr)vk, (IntPtr)(1 | (sc << 16)));
+        System.Threading.Thread.Sleep(holdMs);
+        PostMessage(h, 0x0101, (IntPtr)vk, (IntPtr)(1 | (sc << 16) | (1u << 30) | (1u << 31)));
+    }
 }
 "@
 
-$vk = @{ Grave = 0xC0; F1 = 0x70; F2 = 0x71; F3 = 0x72; F4 = 0x73; F5 = 0x74; F6 = 0x75; F7 = 0x76; F8 = 0x77; F9 = 0x78; F10 = 0x79; F11 = 0x7A; F12 = 0x7B; Up = 0x26; Down = 0x28; Left = 0x25; Right = 0x27; Enter = 0x0D; Esc = 0x1B; Tab = 0x09; Space = 0x20; Back = 0x08 }
-$extended = @('Up', 'Down', 'Left', 'Right')
+$vk = @{ Grave = 0xC0; F1 = 0x70; F2 = 0x71; F3 = 0x72; F4 = 0x73; F5 = 0x74; F6 = 0x75; F7 = 0x76; F8 = 0x77; F9 = 0x78; F10 = 0x79; F11 = 0x7A; F12 = 0x7B; Up = 0x26; Down = 0x28; Left = 0x25; Right = 0x27; Enter = 0x0D; Esc = 0x1B; Tab = 0x09; Space = 0x20; Back = 0x08; Home = 0x24; End = 0x23; Ins = 0x2D; Del = 0x2E; PgUp = 0x21; PgDn = 0x22 }
+# US QWERTY scan codes of letters and digits (set 1).
+$scan = @{}
+$rows = @(@('1234567890', 0x02), @('qwertyuiop', 0x10), @('asdfghjkl', 0x1E), @('zxcvbnm', 0x2C))
+foreach ($r in $rows) { for ($i = 0; $i -lt $r[0].Length; $i++) { $scan[[string]$r[0][$i]] = $r[1] + $i } }
+$extended = @('Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Ins', 'Del', 'PgUp', 'PgDn')
 
 $argsList = @('-game', 'cstrike', '-windowed', '-width', '800', '-height', '600', '-log') + ($GameArgs -split ' ' | Where-Object { $_ })
 $p = Start-Process -FilePath (Join-Path $game 'xash3d.exe') -WorkingDirectory $game -ArgumentList $argsList -PassThru
@@ -52,11 +65,10 @@ foreach ($entry in ($KeyList -split ' ' | Where-Object { $_ })) {
     # "key*ms" holds the key down for ms milliseconds (movement)
     $k, $hold = $entry -split '\*'
     if (-not $hold) { $hold = 60 }
-    if ($vk.ContainsKey($k)) { $code = $vk[$k] }
-    elseif ($k.Length -eq 1) { $code = [int][char]$k.ToUpper() }
-    else { Write-Host "unknown key $k"; continue }
     Add-Content -Path $log -Value "[touche $entry]" -Encoding UTF8
-    [K]::Press($hwnd, [uint32]$code, $extended -contains $k, [int]$hold)
+    if ($vk.ContainsKey($k)) { [K]::Press($hwnd, [uint32]$vk[$k], $extended -contains $k, [int]$hold) }
+    elseif ($scan.ContainsKey($k.ToLower())) { [K]::PressScan($hwnd, [uint32]$scan[$k.ToLower()], [int]$hold) }
+    else { Write-Host "unknown key $k"; continue }
     Start-Sleep -Milliseconds $KeyDelayMs
 }
 Start-Sleep -Seconds 1

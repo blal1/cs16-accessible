@@ -45,6 +45,7 @@
 "Choose logo color"                                                       "Choisir la couleur du logo"
 "Choose your player name, and select visual options for your character"   "Choisissez votre nom de joueur et l'apparence de votre personnage"
 "Colors"                                                                  "Couleurs"
+"Color"                                                                   "Couleur"
 "Command"                                                                 "Commande"
 "Command rate (cl_cmdrate)"                                               "Fréquence des commandes (cl_cmdrate)"
 "Command:"                                                                "Commande :"

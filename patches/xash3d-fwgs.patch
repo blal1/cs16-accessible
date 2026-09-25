@@ -196,10 +196,10 @@ index 0000000..14ddaef
 +#endif // ACCESS_TTS_H
 diff --git a/engine/client/accessibility/con_access.c b/engine/client/accessibility/con_access.c
 new file mode 100644
-index 0000000..7669206
+index 0000000..fa101c2
 --- /dev/null
 +++ b/engine/client/accessibility/con_access.c
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,252 @@
 +/*
 +con_access.c - screen reader support for the console and the chat input line
 +
@@ -313,6 +313,81 @@ index 0000000..7669206
 +	s_lastCursor = field ? field->cursor : 0;
 +}
 +
++// Last console line that explains a disconnection (kick, ban, full server...).
++static char s_dropReason[MAX_STRING];
++static double s_dropReasonTime;
++
++static qboolean IsDropReason( const char *text )
++{
++	static const char *const words[] =
++	{
++		"kick", "Kick", "KICK", "ban", "Ban", "BAN", "Reason", "reason", "rejected", "refused",
++		"password", "is full", "timed out", "Disconnected", "disconnect",
++	};
++	int i;
++
++	for( i = 0; i < (int)( sizeof( words ) / sizeof( words[0] )); i++ )
++		if( Q_strstr( text, words[i] ))
++			return true;
++	return false;
++}
++
++static qboolean IsLocalServer( const char *name )
++{
++	return !name[0] || !Q_stricmp( name, "localhost" ) || !Q_stricmp( name, "loopback" );
++}
++
++// Connection steps, which only a progress bar shows: connecting, loading,
++// resource downloads (file count and percent), and why a connection ended.
++void ConAccess_ConnectionFrame( void )
++{
++	static int s_lastState = ca_disconnected;
++	static qboolean s_downloading;
++	static double s_lastDownloadSpeech;
++	const int state = cls.state;
++	const double now = Platform_DoubleTime();
++	char text[MAX_STRING + 64];
++
++	if( state != s_lastState )
++	{
++		text[0] = 0;
++		if( state == ca_connecting && !IsLocalServer( cls.servername ))
++			Q_snprintf( text, sizeof( text ), "Connexion à %s", cls.servername );
++		else if( state == ca_connected && s_lastState == ca_connecting && !IsLocalServer( cls.servername ))
++			Q_strncpy( text, "Connecté, chargement", sizeof( text ));
++		else if( state == ca_disconnected && s_lastState != ca_disconnected && s_lastState != ca_cinematic )
++		{
++			if( s_dropReason[0] && now - s_dropReasonTime < 10.0 )
++				Q_snprintf( text, sizeof( text ), "Déconnecté du serveur. %s", s_dropReason );
++			else Q_strncpy( text, "Déconnecté du serveur", sizeof( text ));
++			s_dropReason[0] = 0;
++		}
++		if( text[0] )
++			AccessTts_Speak( text, 1 );
++		s_lastState = state;
++	}
++
++	if( scr_download.value >= 0.0f && host.downloadfile[0] )
++	{
++		// Servers push dozens of files: speak progress every few seconds only.
++		if( !s_downloading || now - s_lastDownloadSpeech > 5.0 )
++		{
++			const char *base = Q_strrchr( host.downloadfile, '/' );
++			Q_snprintf( text, sizeof( text ), "%s%d fichiers restants, %s, %d pour cent",
++				s_downloading ? "" : "Téléchargement des fichiers du serveur. ",
++				host.downloadcount, base ? base + 1 : host.downloadfile, (int)scr_download.value );
++			AccessTts_Speak( text, 0 );
++			s_lastDownloadSpeech = now;
++		}
++		s_downloading = true;
++	}
++	else if( s_downloading && scr_download.value < 0.0f )
++	{
++		AccessTts_Speak( "Téléchargements terminés", 0 );
++		s_downloading = false;
++	}
++}
++
 +void ConAccess_Frame( const field_t *input, const field_t *chat, const char *chatCmd )
 +{
 +	const int dest = cls.key_dest;
@@ -353,7 +428,16 @@ index 0000000..7669206
 +{
 +	char clean[MAX_STRING];
 +
-+	if( cls.key_dest != key_console || !text || !text[0] )
++	if( !text || !text[0] )
++		return;
++
++	if( cls.state != ca_disconnected && IsDropReason( text ))
++	{
++		CleanText( text, s_dropReason, sizeof( s_dropReason ));
++		s_dropReasonTime = Platform_DoubleTime();
++	}
++
++	if( cls.key_dest != key_console )
 +		return;
 +	// The command the user just typed is echoed as ">command": already known.
 +	if( text[0] == '>' )
@@ -370,10 +454,10 @@ index 0000000..7669206
 +}
 diff --git a/engine/client/accessibility/con_access.h b/engine/client/accessibility/con_access.h
 new file mode 100644
-index 0000000..ebd4731
+index 0000000..e722a69
 --- /dev/null
 +++ b/engine/client/accessibility/con_access.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,18 @@
 +/*
 +con_access.h - screen reader support for the console and the chat input line
 +*/
@@ -387,8 +471,32 @@ index 0000000..ebd4731
 +void ConAccess_OnLine( const char *text );
 +// The chat line was sent with Enter.
 +void ConAccess_OnChatSent( void );
++// Per frame, in every connection state (the console does not run while
++// connecting): connection steps, resource downloads, disconnection reason.
++void ConAccess_ConnectionFrame( void );
 +
 +#endif // CON_ACCESS_H
+diff --git a/engine/client/cl_scrn.c b/engine/client/cl_scrn.c
+index 6c550c7..23d7373 100644
+--- a/engine/client/cl_scrn.c
++++ b/engine/client/cl_scrn.c
+@@ -19,6 +19,7 @@ GNU General Public License for more details.
+ #include "qfont.h"
+ #include "input.h"
+ #include "library.h"
++#include "accessibility/con_access.h"
+ 
+ CVAR_DEFINE_AUTO( scr_centertime, "2.5", 0, "centerprint hold time" );
+ CVAR_DEFINE_AUTO( scr_loading, "0", 0, "loading bar progress" );
+@@ -673,6 +674,8 @@ void SCR_UpdateScreen( void )
+ {
+ 	qboolean screen_redraw = true; // assume screen has been redrawn
+ 
++	ConAccess_ConnectionFrame();
++
+ 	if( !V_PreRender( )) return;
+ 
+ 	switch( cls.state )
 diff --git a/engine/client/console.c b/engine/client/console.c
 index 62ac3eb..47bb11d 100644
 --- a/engine/client/console.c

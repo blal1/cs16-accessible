@@ -24,6 +24,7 @@
 !/tools/scripts/ExportDecompiled.java
 !/tools/scripts/run_decompile.sh
 !/tools/tests/
+/tools/tests/last_report.txt*
 !/tools/navtools/
 /tools/navtools/*
 !/tools/navtools/test_access_map.cpp

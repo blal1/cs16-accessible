@@ -50,5 +50,5 @@ CS16_Accessible\
   tools\scripts\      scripts : téléchargement, compilation, assemblage, tests
   tools\tests\        configurations de test (bots, grenades, visée)
   repos\              sources (créé par setup_sources.ps1)
-  analysis\sons\      les 19 sons au format WAV, pour les apprendre
+  analysis\sons\      les 26 sons au format WAV, pour les apprendre
 ```

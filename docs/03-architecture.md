@@ -82,7 +82,7 @@ l'envoi d'un message de chat.
 |---|---|
 | `access_speech.cpp` | annonces du HUD (santé, armure, argent, arme, zones), chat, radio, messages centraux, menus numérotés, frags ; regroupement des rafales ; `access_status` ; exécution de `access.cfg` ; rechargement de la langue |
 | `access_screens.cpp` | tableau des scores, minuterie, MOTD (HTML nettoyé), textes d'aide, joueur visé, spectateur, fin de partie |
-| `access_audio.cpp` | synthèse des 19 sons au démarrage et lecture spatialisée avec XAudio2 |
+| `access_audio.cpp` | synthèse des 26 sons au démarrage et lecture spatialisée avec XAudio2 |
 | `access_map.cpp` | lecture des objectifs dans le fichier `.bsp` et du maillage de navigation des bots (`.nav`) ; recherche de chemin A* |
 | `access_nav.cpp` | à chaque image : sonar, vides, balayage radar, guidage, ennemis, visée, grenades, dégâts, battements de cœur, boussole |
 

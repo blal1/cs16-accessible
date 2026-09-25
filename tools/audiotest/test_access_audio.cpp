@@ -5,7 +5,7 @@
 
 static const char *kNames[CUE_COUNT] = { "wall_tap", "wall_front", "ledge", "step", "beacon", "arrived", "enemy",
 	"teammate", "aim", "aim_lock", "objective", "north", "scan", "opening", "damage", "grenade", "heartbeat",
-	"ammo_low", "enemy_spotted" };
+	"ammo_low", "enemy_spotted", "item", "footstep", "gunshot", "ladder", "door", "water", "hit" };
 
 static void WriteWav( const char *path, const std::vector<float> &pcm )
 {

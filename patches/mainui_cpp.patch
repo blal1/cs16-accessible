@@ -294,6 +294,47 @@ index b5e6c24..e9100f5 100644
  	const char *GetBuffer()
  	{
  		return szBuffer;
+diff --git a/controls/ItemsHolder.cpp b/controls/ItemsHolder.cpp
+index 7be4928..0e1f2ad 100644
+--- a/controls/ItemsHolder.cpp
++++ b/controls/ItemsHolder.cpp
+@@ -187,6 +187,17 @@ bool CMenuItemsHolder::Key( const int key, const bool down )
+ 
+ 				ClearBits( m_pItems[m_iCursorPrev]->iFlags, QMF_HASKEYBOARDFOCUS );
+ 				SetBits( m_pItems[m_iCursor]->iFlags, QMF_HASKEYBOARDFOCUS );
++
++				// Entering a nested group: start at its edge on the side we
++				// came from (first item going down, last going up).
++				CMenuItemsHolder *group = dynamic_cast<CMenuItemsHolder *>( m_pItems[m_iCursor] );
++				if( group && !group->IsWindow() && group->ItemCount() > 0 )
++				{
++					group->m_iCursorPrev = group->m_iCursor;
++					group->m_iCursor = direction > 0 ? 0 : group->ItemCount() - 1;
++					if( !group->AdjustCursor( direction ))
++						group->m_iCursor = group->m_iCursorPrev;
++				}
+ 			}
+ 		}
+ 		else
+@@ -411,7 +422,17 @@ wrap:
+ 	}
+ 
+ 	if( wrapped )
+-		return m_bWrapCursor;
++	{
++		// Only windows cycle. A nested group (settings block, script page) that
++		// reaches its end hands the arrow back to its parent, so the keyboard
++		// order stays one linear list instead of trapping the focus in a loop.
++		if( !m_bWrapCursor || !IsWindow() )
++		{
++			m_iCursor = m_iCursorPrev;
++			return false;
++		}
++		return true;
++	}
+ 	return true;
+ }
+ 
 diff --git a/controls/MessageBox.h b/controls/MessageBox.h
 index 02aeaef..8c20c28 100644
 --- a/controls/MessageBox.h
@@ -320,13 +361,14 @@ index 23fb0a9..89c9dd1 100644
  
  	void SetKeepSlider( int keepSlider ) { m_iKeepSlider = keepSlider; }
 diff --git a/controls/SpinControl.h b/controls/SpinControl.h
-index 1829837..50a8c9d 100644
+index 1829837..cc77320 100644
 --- a/controls/SpinControl.h
 +++ b/controls/SpinControl.h
-@@ -42,6 +42,7 @@ public:
+@@ -42,6 +42,8 @@ public:
  	void SetCurrentValue( float curValue );
  
  	float GetCurrentValue( ) { return m_flCurValue; }
++	float GetMaxValue( ) const { return m_flMaxValue; }	// accessibility: "page 1 of 2"
 +	const char *GetDisplayText( ) const { return m_szDisplay; }
  	const char *GetCurrentString( ) { return m_pModel ? m_pModel->GetText( (int)m_flCurValue ) : NULL; }
  
@@ -413,10 +455,10 @@ index e38f09d..2b388ce 100644
  	bool IsAscend( void ) { return m_bAscend; }
 diff --git a/menu_access.cpp b/menu_access.cpp
 new file mode 100644
-index 0000000..fcece10
+index 0000000..deb9603
 --- /dev/null
 +++ b/menu_access.cpp
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,928 @@
 +/*
 +menu_access.cpp - screen reader support for every menu window (NVDA)
 +
@@ -449,6 +491,7 @@ index 0000000..fcece10
 +#include "Table.h"
 +#include "MessageBox.h"
 +#include "YesNoMessageBox.h"
++#include "KbActListModel.h"
 +
 +#include "menu_access.h"
 +#include "access_tts.h"
@@ -456,6 +499,11 @@ index 0000000..fcece10
 +#include <stdio.h>
 +#include <string.h>
 +#include <typeinfo>
++
++#ifdef _WIN32
++// user32, declared here: windows.h clashes with the menu headers.
++extern "C" __declspec( dllimport ) unsigned int __stdcall MapVirtualKeyA( unsigned int code, unsigned int mapType );
++#endif
 +
 +static const size_t DESC_SIZE = 1024;
 +
@@ -465,6 +513,7 @@ index 0000000..fcece10
 +static char s_szLastField[DESC_SIZE];
 +static int s_iLastFieldCursor;
 +static char s_szLastStaticText[DESC_SIZE];
++static char s_szLastRowKey[DESC_SIZE];
 +static bool s_bToldHowToNavigate;
 +static CMenuBaseWindow *s_pSettlingWindow;
 +static unsigned int s_uSettleStart;
@@ -532,6 +581,13 @@ index 0000000..fcece10
 +		AccessTts_Speak( text, interrupt ? 1 : 0 );
 +}
 +
++void MenuAccess_Announce( const char *text, bool interrupt )
++{
++	char clean[DESC_SIZE] = "";
++	Append( clean, sizeof( clean ), text );
++	Speak( clean, interrupt );
++}
++
 +// Spoken form of one UTF-8 character.
 +static void DescribeChar( const char *utf8, int len, bool hidden, char *out, size_t size )
 +{
@@ -577,7 +633,7 @@ index 0000000..fcece10
 +		{ "CMenuVidModes", "Résolution et mode d'affichage" },
 +		{ "CMenuControls", "Touches du clavier" },
 +		{ "CAdvancedControls", "Commandes avancées, souris" },
-+		{ "CMenuGameOptions", "Options de jeu" },
++		{ "CMenuGameOptions", "Options avancées" },
 +		{ "CMenuPlayerSetup", "Personnalisation du joueur" },
 +		{ "CMenuCrosshair", "Réglage du viseur" },
 +		{ "CMenuInputDevices", "Périphériques d'entrée" },
@@ -701,6 +757,163 @@ index 0000000..fcece10
 +	}
 +}
 +
++// Engine key names (key binding list) in words.
++static const char *KeyNameInWords( const char *key )
++{
++	static const struct { const char *name; const char *spoken; } keys[] =
++	{
++		{ "UPARROW", "flèche haut" }, { "DOWNARROW", "flèche bas" },
++		{ "LEFTARROW", "flèche gauche" }, { "RIGHTARROW", "flèche droite" },
++		{ "MOUSE1", "clic gauche" }, { "MOUSE2", "clic droit" }, { "MOUSE3", "clic molette" },
++		{ "MOUSE4", "bouton souris 4" }, { "MOUSE5", "bouton souris 5" },
++		{ "MWHEELUP", "molette vers le haut" }, { "MWHEELDOWN", "molette vers le bas" },
++		{ "SPACE", "espace" }, { "ENTER", "entrée" }, { "ESCAPE", "échap" }, { "TAB", "tabulation" },
++		{ "BACKSPACE", "retour arrière" }, { "SHIFT", "majuscule" }, { "CTRL", "contrôle" },
++		{ "ALT", "alt" }, { "CAPSLOCK", "verrouillage majuscule" }, { "PAUSE", "pause" },
++		{ "INS", "inser" }, { "DEL", "suppr" }, { "HOME", "début" }, { "END", "fin" },
++		{ "PGUP", "page précédente" }, { "PGDN", "page suivante" },
++		{ "SEMICOLON", "point-virgule" }, { "KP_ENTER", "entrée du pavé numérique" },
++		{ "KP_INS", "0 du pavé numérique" }, { "KP_END", "1 du pavé numérique" },
++		{ "KP_DOWNARROW", "2 du pavé numérique" }, { "KP_PGDN", "3 du pavé numérique" },
++		{ "KP_LEFTARROW", "4 du pavé numérique" }, { "KP_5", "5 du pavé numérique" },
++		{ "KP_RIGHTARROW", "6 du pavé numérique" }, { "KP_HOME", "7 du pavé numérique" },
++		{ "KP_UPARROW", "8 du pavé numérique" }, { "KP_PGUP", "9 du pavé numérique" },
++		{ "KP_SLASH", "barre oblique du pavé numérique" }, { "KP_MINUS", "moins du pavé numérique" },
++		{ "KP_PLUS", "plus du pavé numérique" }, { "KP_DEL", "point du pavé numérique" },
++		{ "`", "touche console" }, { "~", "touche console" },
++	};
++	for( size_t i = 0; i < sizeof( keys ) / sizeof( keys[0] ); i++ )
++		if( !stricmp( key, keys[i].name ))
++			return keys[i].spoken;
++	return NULL;
++}
++
++// The engine names character keys by their US QWERTY position ("w" is the key
++// left of "e"). Say the character printed on that key in the active Windows
++// layout instead: on AZERTY, "w" is Z. Other systems keep the QWERTY name.
++// Returns a Unicode code point (Latin-1 range: é, ù, ²... on European layouts).
++static unsigned int KeyCapInLayout( char qwerty )
++{
++#ifdef _WIN32
++	static const char rows[] = "1234567890-=" "qwertyuiop[]" "asdfghjkl;'`" "\\zxcvbnm,./";
++	static const unsigned char firstScan[] = { 0x02, 0x10, 0x1E, 0x2B };
++	static const int rowStart[] = { 0, 12, 24, 36, 47 };
++	for( int r = 0; r < 4; r++ )
++	{
++		for( int i = rowStart[r]; i < rowStart[r + 1]; i++ )
++		{
++			if( rows[i] != qwerty )
++				continue;
++			const unsigned int scan = firstScan[r] + ( i - rowStart[r] );
++			const unsigned int vk = MapVirtualKeyA( scan, 1 /* MAPVK_VSC_TO_VK */ );
++			const unsigned int ch = vk ? MapVirtualKeyA( vk, 2 /* MAPVK_VK_TO_CHAR */ ) & 0x7FFF : 0;
++			// The ANSI code page of Latin layouts (1252) matches Unicode here.
++			if(( ch >= 0x20 && ch < 0x7F ) || ( ch >= 0xA0 && ch <= 0xFF ))
++				return ch;
++			return (unsigned char)qwerty;
++		}
++	}
++#endif
++	return (unsigned char)qwerty;
++}
++
++static const char *PunctuationName( char c )
++{
++	switch( c )
++	{
++	case '\'': return "apostrophe";
++	case '/': return "barre oblique";
++	case '\\': return "barre oblique inverse";
++	case ',': return "virgule";
++	case '.': return "point";
++	case ';': return "point-virgule";
++	case ':': return "deux-points";
++	case '-': return "moins";
++	case '=': return "égal";
++	case '[': return "crochet ouvrant";
++	case ']': return "crochet fermant";
++	case '!': return "point d'exclamation";
++	case '*': return "étoile";
++	case '$': return "dollar";
++	case '^': return "accent circonflexe";
++	case '<': return "inférieur";
++	case ')': return "parenthèse fermante";
++	default: return NULL;
++	}
++}
++
++// Spoken form of one table cell, false when it carries nothing worth hearing.
++// keyNames: the cell may be an engine key name (key binding list).
++static bool RowCellPhrase( const char *rawCell, char *out, size_t size, bool keyNames )
++{
++	out[0] = 0;
++	char cell[256] = "";
++	Append( cell, sizeof( cell ), rawCell );	// without ^N colour codes
++	if( !cell[0] )
++		return false;
++	if( keyNames )
++	{
++		if( const char *words = KeyNameInWords( cell ))
++		{
++			snprintf( out, size, "%s", words );
++			return true;
++		}
++		// Character keys: the character printed on the key, letters in upper case.
++		if( !cell[1] && (unsigned char)cell[0] > ' ' && (unsigned char)cell[0] < 0x7F )
++		{
++			const unsigned int cap = KeyCapInLayout( cell[0] >= 'A' && cell[0] <= 'Z' ? cell[0] - 'A' + 'a' : cell[0] );
++			const char *name = cap < 0x80 ? PunctuationName( (char)cap ) : NULL;
++			if( name )
++				snprintf( out, size, "%s", name );
++			else if( cap >= 'a' && cap <= 'z' )
++				snprintf( out, size, "%c", (char)( cap - 'a' + 'A' ));
++			else if( cap < 0x80 )
++				snprintf( out, size, "%c", (char)cap );
++			else	// two-byte UTF-8
++				snprintf( out, size, "%c%c", (char)( 0xC0 | ( cap >> 6 )), (char)( 0x80 | ( cap & 0x3F )));
++			return true;
++		}
++	}
++	// Picture cells (server browser): the path names what the icon means.
++	if( !strncmp( cell, "gfx/", 4 ))
++	{
++		if( strstr( cell, "lock" ))
++			snprintf( out, size, "mot de passe" );
++		else if( strstr( cell, "favorite" ))
++			snprintf( out, size, "favori" );
++		return out[0] != 0;
++	}
++	// Rows made only of '=' are section separators in the key binding list.
++	if( strspn( cell, "=-_ " ) == strlen( cell ))
++	{
++		snprintf( out, size, "séparateur de section" );
++		return true;
++	}
++	// Maps without a title in their .bsp.
++	if( !strcmp( cell, "No Title" ))
++		return false;
++
++	int a, b, c, d, port;
++	char tail;
++	// Server address: available through "Infos sur la partie", not in every row.
++	if( sscanf( cell, "%d.%d.%d.%d:%d%c", &a, &b, &c, &d, &port, &tail ) == 5 )
++		return false;
++	// "13\32" players.
++	if( sscanf( cell, "%d\\%d%c", &a, &b, &tail ) == 2 )
++	{
++		snprintf( out, size, "%d joueur%s sur %d", a, a > 1 ? "s" : "", b );
++		return true;
++	}
++	// "59 ms" ping.
++	if( sscanf( cell, "%d ms%c", &a, &tail ) == 1 && strstr( cell, " ms" ))
++	{
++		snprintf( out, size, "ping %d", a );
++		return true;
++	}
++	Append( out, size, cell );
++	return out[0] != 0;
++}
++
 +static void DescribeTableRow( CMenuTable *table, char *out, size_t size )
 +{
 +	CMenuBaseModel *model = table->GetModel();
@@ -719,29 +932,53 @@ index 0000000..fcece10
 +		return;
 +	}
 +
-+	char pos[64];
-+	snprintf( pos, sizeof( pos ), "ligne %d sur %d", row + 1, rows );
-+	Append( out, size, pos );
++	// A row reads as one plain phrase: cell values only, no column headers, no
++	// position (said once when the list gets the focus), noise cells dropped.
++	CMenuItemsHolder *win = table->Parent();
++	const bool keyList = win && win->szName && !strcmp( win->szName, "CMenuControls" );
++	int spokenCells = 0;
 +	for( int col = 0; col < model->GetColumns(); col++ )
 +	{
 +		const char *cell = model->GetCellText( row, col );
-+		if( !cell || !cell[0] )
++		char phrase[256];
++		if( !RowCellPhrase( cell, phrase, sizeof( phrase ), keyList && col > 0 ))
 +			continue;
-+		// Rows made only of '=' are section separators in the key binding list.
-+		if( strspn( cell, "=-_ " ) == strlen( cell ))
-+		{
-+			Append( out, size, ", séparateur de section" );
-+			continue;
-+		}
-+		Append( out, size, ", " );
++		// A bare number means nothing without its column ("Éliminations 5"),
++		// except the "#" position column, and in two-column name/value lists.
 +		const char *header = table->GetHeaderText( col );
-+		if( header && header[0] )
++		if( phrase[strspn( phrase, "0123456789:. " )] == 0 && header && header[0] )
 +		{
-+			Append( out, size, header );
-+			Append( out, size, " " );
++			if( !strcmp( header, "#" ))
++				continue;
++			if( model->GetColumns() > 2 )
++			{
++				char labelled[256];
++				snprintf( labelled, sizeof( labelled ), "%s %s", header, phrase );
++				snprintf( phrase, sizeof( phrase ), "%s", labelled );
++			}
 +		}
-+		Append( out, size, cell );
++		AppendSep( out, size, phrase );
++		spokenCells++;
 +	}
++	CMenuKbActListModel *keys = keyList ? dynamic_cast<CMenuKbActListModel *>( model ) : NULL;
++	if( keys && spokenCells == 1 && strcmp( out, "séparateur de section" ))
++	{
++		if( keys->IsLineUsable( row ))
++		{
++			// An action without any key.
++			AppendSep( out, size, "aucune touche" );
++		}
++		else
++		{
++			// A lone label between separators titles the next group of actions.
++			char title[DESC_SIZE];
++			snprintf( title, sizeof( title ), "Section %s", out );
++			out[0] = 0;
++			Append( out, size, title );
++		}
++	}
++	if( !out[0] )
++		Append( out, size, "ligne vide" );
 +}
 +
 +// value: only the part that changes when the user operates the control.
@@ -768,6 +1005,13 @@ index 0000000..fcece10
 +	{
 +		strcpy( kind, "sélecteur, flèches gauche et droite" );
 +		Append( value, DESC_SIZE, sp->GetDisplayText() );
++		// Page selectors of option screens: say how many pages there are.
++		if( sp->szName && !strcmp( sp->szName, L( "Page" )) && !sp->GetCurrentString() )
++		{
++			char total[32];
++			snprintf( total, sizeof( total ), " sur %d", (int)sp->GetMaxValue() );
++			Append( value, DESC_SIZE, total );
++		}
 +	}
 +	else if( CMenuField *f = dynamic_cast<CMenuField *>( item ))
 +	{
@@ -792,7 +1036,12 @@ index 0000000..fcece10
 +	}
 +	else if( CMenuTable *tb = dynamic_cast<CMenuTable *>( item ))
 +	{
-+		strcpy( kind, "liste, flèches haut et bas, Entrée pour choisir" );
++		CMenuBaseModel *model = tb->GetModel();
++		const int rows = model ? model->GetRows() : 0;
++		if( rows > 0 )
++			snprintf( kind, 128, "liste de %d élément%s, Entrée pour choisir", rows, rows > 1 ? "s" : "" );
++		else
++			strcpy( kind, "liste" );	// the value says "vide"
 +		DescribeTableRow( tb, value, DESC_SIZE );
 +	}
 +	else if( dynamic_cast<CMenuPicButton *>( item ))
@@ -807,6 +1056,15 @@ index 0000000..fcece10
 +{
 +	if( item->szName && item->szName[0] )
 +		return item->szName;
++
++	// An unnamed one-column list is named by its column ("Résolution").
++	CMenuTable *table = dynamic_cast<CMenuTable *>( item );
++	if( table && table->GetModel() && table->GetModel()->GetColumns() == 1 )
++	{
++		const char *header = table->GetHeaderText( 0 );
++		if( header && header[0] && strcmp( header, "#" ))
++			return header;
++	}
 +
 +	CMenuItemsHolder *parent = item->Parent();
 +	if( !parent )
@@ -839,12 +1097,16 @@ index 0000000..fcece10
 +	char kind[128], value[DESC_SIZE];
 +	DescribeItem( item, kind, value );
 +
-+	Append( out, size, SpokenName( item ));
++	// Without a name or a label, the description is the label (script-built
++	// option pages: "Délai avant disparition des corps").
++	const char *name = SpokenName( item );
++	const bool statusAsName = ( !name || !name[0] ) && item->szStatusText && item->szStatusText[0];
++	Append( out, size, statusAsName ? item->szStatusText : name );
 +	AppendSep( out, size, kind );
 +	AppendSep( out, size, value );
 +	if( item->iFlags & QMF_GRAYED )
 +		AppendSep( out, size, "indisponible" );
-+	if( item->szStatusText && item->szStatusText[0] && ( !item->szName || strcmp( item->szName, item->szStatusText )))
++	if( !statusAsName && item->szStatusText && item->szStatusText[0] && ( !name || strcmp( name, item->szStatusText )))
 +	{
 +		Append( out, size, ". " );
 +		Append( out, size, item->szStatusText );
@@ -860,13 +1122,30 @@ index 0000000..fcece10
 +		CMenuBaseItem *item = win->GetItemByIndex( i );
 +		if( !item || !item->IsVisible() || !dynamic_cast<CMenuAction *>( item ))
 +			continue;
-+		if( item->szName && item->szName[0] )
++		// Footnotes ("* Uses Opus codec") are not read with the window title.
++		if( item->szName && item->szName[0] && item->szName[0] != '*' )
 +		{
-+			if( out[0] )
-+				Append( out, size, ". " );
++			// "Server IP address:" followed by its value reads as one phrase.
++			const size_t len = strlen( out );
++			if( len )
++				Append( out, size, out[len - 1] == ':' ? " " : ". " );
 +			Append( out, size, item->szName );
 +		}
 +	}
++}
++
++// Identity of the selected table row (index + first cell): lists refreshed in
++// place (server ping and player counts) must not repeat the row being read.
++static void TableRowKey( CMenuBaseItem *item, char *out, size_t size )
++{
++	out[0] = 0;
++	CMenuTable *table = dynamic_cast<CMenuTable *>( item );
++	CMenuBaseModel *model = table ? table->GetModel() : NULL;
++	if( !model )
++		return;
++	const int row = table->GetCurrentIndex();
++	const char *first = row >= 0 && row < model->GetRows() ? model->GetCellText( row, 0 ) : "";
++	snprintf( out, size, "%d/%d:%s", row, model->GetRows(), first ? first : "" );
 +}
 +
 +// Text field editing: say what was typed or deleted, or the character reached.
@@ -1095,8 +1374,12 @@ index 0000000..fcece10
 +	}
 +	else if( strcmp( value, s_szLastValue ))
 +	{
-+		Speak( value, true );
++		char rowKey[DESC_SIZE];
++		TableRowKey( item, rowKey, sizeof( rowKey ));
++		if( !rowKey[0] || strcmp( rowKey, s_szLastRowKey ))
++			Speak( value, true );
 +	}
++	TableRowKey( item, s_szLastRowKey, sizeof( s_szLastRowKey ));
 +
 +	snprintf( s_szLastStaticText, sizeof( s_szLastStaticText ), "%s", statics );
 +	s_pLastWindow = win;
@@ -1106,10 +1389,10 @@ index 0000000..fcece10
 +}
 diff --git a/menu_access.h b/menu_access.h
 new file mode 100644
-index 0000000..d3df0c9
+index 0000000..491a8e9
 --- /dev/null
 +++ b/menu_access.h
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,15 @@
 +/*
 +menu_access.h - screen reader support for every menu window (NVDA)
 +*/
@@ -1123,6 +1406,162 @@ index 0000000..d3df0c9
 +bool MenuAccess_MouseEnabled( void );
 +// Moves the menu pointer off screen when the mouse is disabled (see access_menu_mouse).
 +void MenuAccess_ParkPointer( void );
++// Speaks an event that no window focus reports (local server start).
++void MenuAccess_Announce( const char *text, bool interrupt );
+\ No newline at end of file
+diff --git a/menus/ConnectionProgress.cpp b/menus/ConnectionProgress.cpp
+index 3581908..3cbcb9f 100644
+--- a/menus/ConnectionProgress.cpp
++++ b/menus/ConnectionProgress.cpp
+@@ -25,6 +25,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ #include "ProgressBar.h"
+ #include "PicButton.h"
+ #include "YesNoMessageBox.h"
++#include "menu_access.h"
+ 
+ enum EState
+ {
+@@ -373,6 +374,10 @@ void UI_ConnectionProgress_Precache( void )
+ 
+ void UI_ConnectionProgress_Connect( const char *server ) // NULL for local server
+ {
++	// Remote connections are spoken by the engine (con_access.c), which also
++	// sees console "connect" commands; only the local server start is ours.
++	if( !server )
++		MenuAccess_Announce( "Démarrage du serveur", true );
+ 	if( menu_connectionprogress->m_iState == STATE_CONSOLE )
+ 		return;
+ 
+diff --git a/menus/Crosshair.cpp b/menus/Crosshair.cpp
+index 0aebc3b..1121eb8 100644
+--- a/menus/Crosshair.cpp
++++ b/menus/Crosshair.cpp
+@@ -191,11 +191,14 @@ void CMenuClassicCrosshair::_Init()
+ 	static const char *sizelist[] = { L( "GameUI_Auto" ), L( "GameUI_Small" ), L( "GameUI_Medium" ), L( "GameUI_Large" ) };
+ 	static CStringArrayModel sizes( sizelist, V_ARRAYSIZE( sizelist ) );
+ 
++	// No caption is drawn next to these two: name them (drawn above, and spoken).
++	size.szName = L( "Size" );
+ 	size.Setup( &sizes );
+ 	size.LinkCvar( "cl_crosshair_size", CMenuEditable::CVAR_VALUE );
+ 	size.SetRect( x, y, 220, 32 );
+ 	y += 60;
+ 
++	color.szName = L( "Color" );
+ 	color.Setup( &colors );
+ 	color.LinkCvar( "cl_crosshair_color", CMenuEditable::CVAR_STRING );
+ 	color.SetRect( x, y, 220, 32 );
+@@ -211,6 +214,7 @@ void CMenuClassicCrosshair::_Init()
+ 	preview.SetRect( x, y, 200, 200 );
+ 	preview.hImage = EngFuncs::PIC_Load( "gfx/vgui/crosshair.tga", 0 );
+ 	preview.hWhite = EngFuncs::PIC_Load( "*white" );
++	preview.iFlags |= QMF_INACTIVE; // a picture: keep it out of the keyboard focus
+ 
+ 	AddItem( preview );
+ 	AddItem( size );
+@@ -303,6 +307,7 @@ void CMenuXhair::_Init()
+ 	preview.SetRect( x, y, 200, 200 );
+ 	preview.hImage = EngFuncs::PIC_Load( "gfx/vgui/crosshair.tga", 0 );
+ 	preview.hWhite = EngFuncs::PIC_Load( "*white" );
++	preview.iFlags |= QMF_INACTIVE; // a picture: keep it out of the keyboard focus
+ 
+ 	AddItem( r );
+ 	AddItem( g );
+diff --git a/menus/CustomGame.cpp b/menus/CustomGame.cpp
+index 5237a13..c84c2a5 100644
+--- a/menus/CustomGame.cpp
++++ b/menus/CustomGame.cpp
+@@ -253,6 +253,7 @@ void CMenuCustomGame::_Init( void )
+ 	go2url = AddButton( L( "Visit web site" ), nullptr, PC_VISIT_WEB_SITE, MenuCb( &CMenuCustomGame::Go2Site ) );
+ 	AddButton( L( "Done" ), nullptr, PC_DONE, VoidCb( &CMenuCustomGame::Hide ) );
+ 
++	modList.szName = L( "GameUI_Game" );	// not drawn by tables: for screen readers
+ 	modList.onChanged = VoidCb( &CMenuCustomGame::UpdateExtras );
+ 	modList.SetupColumn( 0, L( "GameUI_Type" ), 0.20f );
+ 	modList.SetupColumn( 1, L( "Name" ), 0.50f );
+diff --git a/menus/Main.cpp b/menus/Main.cpp
+index 06f0bab..5917647 100644
+--- a/menus/Main.cpp
++++ b/menus/Main.cpp
+@@ -29,6 +29,31 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ #include "PlayerIntroduceDialog.h"
+ #include "gameinfo.h"
+ #include "AnimatedBanner.h"
++#include "menu_access.h"
++
++#ifdef _WIN32
++// kernel32, declared here: windows.h clashes with the menu headers.
++extern "C" __declspec( dllimport ) unsigned long __stdcall GetFullPathNameA( const char *name, unsigned long size, char *buffer, char **filePart );
++#endif
++
++// The menu has no readme screen: open the mod's readme.txt in Notepad, which
++// screen readers read like any document.
++static void OpenReadme( void )
++{
++	char path[128];
++	snprintf( path, sizeof( path ), "%s\\readme.txt", gMenu.m_gameinfo.gamefolder );
++	MenuAccess_Announce( "Ouverture du fichier Lisez-moi dans le Bloc-notes", true );
++#ifdef _WIN32
++	// The shell does not resolve paths relative to the game: make it absolute.
++	char full[512], quoted[520];
++	if( !GetFullPathNameA( path, sizeof( full ), full, NULL ))
++		snprintf( full, sizeof( full ), "%s", path );
++	snprintf( quoted, sizeof( quoted ), "\"%s\"", full );
++	EngFuncs::ShellExecute( "notepad.exe", quoted, false );
++#else
++	EngFuncs::ShellExecute( path, NULL, false );
++#endif
++}
+ #include "MovieBanner.h"
+ 
+ #define ART_MINIMIZE_N	"gfx/shell/min_n"
+@@ -223,15 +248,20 @@ void CMenuMain::_Init( void )
+ 	customGame.iFlags |= QMF_NOTIFY;
+ 	customGame.onReleased = UI_CustomGame_Menu;
+ 
+-	// TODO: add readme screen later
++	// No readme screen in the menu: see OpenReadme().
+ 	readme.SetNameAndStatus( L("View Readme"), L( "StringsList_194" ) );
+ 	readme.SetPicture( PC_VIEW_README );
+ 	readme.iFlags |= QMF_NOTIFY;
++	SET_EVENT( readme.onReleased, OpenReadme() );
+ 
+ 	previews.SetNameAndStatus( L( "Previews" ), L( "StringsList_400" ) );
+ 	previews.SetPicture( PC_PREVIEWS );
+ 	previews.iFlags |= QMF_NOTIFY;
+-	SET_EVENT( previews.onReleased, EngFuncs::ShellExecute( MenuStrings[ IDS_MEDIA_PREVIEWURL ], NULL, false ) );
++	SET_EVENT_MULTI( previews.onReleased,
++	{
++		MenuAccess_Announce( "Ouverture de la page dans le navigateur", true );
++		EngFuncs::ShellExecute( MenuStrings[ IDS_MEDIA_PREVIEWURL ], NULL, false );
++	});
+ 
+ 	quit.SetNameAndStatus( L( "GameUI_GameMenu_Quit" ), L( "GameUI_QuitConfirmationText" ) );
+ 	quit.SetPicture( PC_QUIT );
+diff --git a/menus/PlayerSetup.cpp b/menus/PlayerSetup.cpp
+index 616065d..c35cc48 100644
+--- a/menus/PlayerSetup.cpp
++++ b/menus/PlayerSetup.cpp
+@@ -598,6 +598,8 @@ void CMenuPlayerSetup::_Init( void )
+ 	noProprietaryCodecNotice.colorBase = uiColorHelp;
+ 	noProprietaryCodecNotice.SetCharSize( QM_SMALLFONT );
+ 	noProprietaryCodecNotice.SetRect( 77, receiveVolume.pos.y + 20, 400, 100 );
++	// A footnote, not a control: keep it out of the keyboard (and speech) focus.
++	noProprietaryCodecNotice.iFlags |= QMF_INACTIVE;
+ 
+ 	if( !hideLogos )
+ 	{
+@@ -612,6 +614,10 @@ void CMenuPlayerSetup::_Init( void )
+ 		logoImage.szName = L( "GameUI_SpraypaintImage" );
+ 		logoImage.SetRect( 460, 370, 200, 200 );
+ 
++		// The picture only previews the spray: the spin control carries its name
++		// (drawn as its caption, and spoken), the picture stays out of the focus.
++		logoImage.iFlags |= QMF_INACTIVE;
++		logo.szName = L( "GameUI_SpraypaintImage" );
+ 		logo.Setup( &logosModel );
+ 		logo.LinkCvar( "cl_logofile", CMenuEditable::CVAR_STRING );
+ 		logo.onChanged = VoidCb( &CMenuPlayerSetup::UpdateLogo );
 diff --git a/menus/ServerBrowser.cpp b/menus/ServerBrowser.cpp
 index f7644af..fa34d17 100644
 --- a/menus/ServerBrowser.cpp
@@ -1141,3 +1580,30 @@ index f7644af..fa34d17 100644
  	filterPing.AddItem( "500ms", 500.0f );
  	filterPing.AddItem( "200ms", 200.0f );
  	filterPing.AddItem( "100ms", 100.0f );
+diff --git a/menus/ServerInfo.cpp b/menus/ServerInfo.cpp
+index dae0958..8141c84 100644
+--- a/menus/ServerInfo.cpp
++++ b/menus/ServerInfo.cpp
+@@ -427,6 +427,9 @@ void CMenuServerInfo::_Init()
+ 	done.onReleased = VoidCb( &CMenuServerInfo::Hide );
+ 	done.SetCoord( 72, 650 );
+ 
++	// Tables do not draw szName: these names are for screen readers only.
++	players_list.szName = L( "Players" );
++	rules_list.szName = L( "Server Rule" );
+ 	players_list.bAllowSorting = true;
+ 	players_list.SetModel( &players_model );
+ 	players_list.SetCharSize( QM_SMALLFONT );
+diff --git a/menus/dynamic/ScriptMenu.cpp b/menus/dynamic/ScriptMenu.cpp
+index 2c601f7..14cf91c 100644
+--- a/menus/dynamic/ScriptMenu.cpp
++++ b/menus/dynamic/ScriptMenu.cpp
+@@ -325,6 +325,8 @@ void CMenuScriptConfig::_Init( void )
+ 
+ 	// RemoveItem( unavailable );
+ 	pageSelector.SetRect( 780, 180, 160, 32 );
++	// Left / right flips the option pages: name it (drawn above, and spoken).
++	pageSelector.szName = L( "Page" );
+ 	AddItem( pageSelector );
+ 
+ 

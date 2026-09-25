@@ -50,6 +50,30 @@ powershell -ExecutionPolicy Bypass -File tools\scripts\menu_test.ps1 `
 Les touches sont envoyées par code de touche virtuel : sur un clavier AZERTY, `z` correspond à la
 touche Z (avancer), `w` à la radio.
 
+## La suite complète : `tools\tests\run_suite.ps1`
+
+Une commande lance tous les scénarios (menus, options, touches, viseur, pages d'options, requêtes en jeu,
+guidage, bombe lâchée, flash, rechargement, zones d'otages, échelles, portes, MOTD web, spectateur,
+chat et console, ennemis avec bots) et vérifie dans le journal les phrases attendues :
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\tests\run_suite.ps1             # hors ligne, ~20 minutes
+powershell -ExecutionPolicy Bypass -File tools\tests\run_suite.ps1 -Only flash,zones_hostages
+powershell -ExecutionPolicy Bypass -File tools\tests\run_suite.ps1 -Online     # + un vrai serveur public
+```
+
+Un scénario en échec est relancé une fois (PASS2 : réussi au second essai). Ne tapez pas au clavier
+pendant la suite : le jeu prend le focus à chaque lancement et recevrait vos touches.
+
+Résultat : un tableau PASS / PASS2 / FAIL / WARN (WARN = scénario dépendant des bots, non bloquant) dans
+`tools\tests\last_report.txt`, et la transcription des échecs dans `last_report.txt.log`. Le code de
+sortie est le nombre d'échecs. Les fichiers de test nécessaires (configs, faux MOTD) sont créés dans
+`cstrike\` puis supprimés.
+
+Les lettres sont envoyées par **position QWERTY**, comme le jeu nomme ses touches : `w` avance sur
+n'importe quel clavier. `Del` (Suppr) sert d'attente : elle n'est liée à rien (F1 lance « autobuy »).
+Les scénarios de menu commencent par `Del Up` : Haut place toujours le focus sur « Quitter ».
+
 ## Scénarios utiles
 
 | Vérifier | Commande (paramètres) |
