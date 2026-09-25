@@ -77,8 +77,9 @@ vide. Détails dans [docs/05-tests.md](docs/05-tests.md).
 
 ## Licences
 
-- Code d'accessibilité et patchs : suivent la licence des projets modifiés (GPL pour Xash3D FWGS et
-  cs16-client ; voir chaque projet).
+- Ce dépôt (code d'accessibilité, patchs, scripts, documentation) est publié sous
+  **GNU GPL v3 ou ultérieure** : voir [LICENSE](LICENSE). Elle est compatible avec les projets
+  modifiés (Xash3D FWGS : GPL v3+ ; cs16-client et mainui_cpp : GPL v2+).
 - `distribution/engine/nvdaControllerClient.dll` : NV Access, LGPL 2.1 (licence jointe).
 - Counter-Strike et Half-Life sont des marques de Valve ; aucun fichier de Valve n'est inclus en
   dehors de traductions de textes de menus.
